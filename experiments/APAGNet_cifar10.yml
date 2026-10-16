@@ -1,0 +1,11 @@
+# python main.py --config_path experiments/APAGNet_cifar10.yml
+# torchrun --standalone --nproc_per_node=2 main.py --config_path experiments/APAGNet_cifar10.yml
+dataset: cifar10
+data: ./data/cifar10
+input_size: 32
+download: true
+arch: APAGNet
+save: ./checkpoints
+batch_size: 128
+seed: 1024
+dist_url: env://

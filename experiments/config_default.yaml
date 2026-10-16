@@ -1,0 +1,46 @@
+# All training defaults are defined here, not in main.py.
+# python main.py automatically loads this file from the experiments directory.
+# --config_path selects an experiment YAML whose values override these defaults.
+# data/save/resume paths are relative to the current working directory.
+
+# Dataset and model
+dataset: image_net_1K         # image_net_1K or cifar10
+data: /home/j/database/ImageNet1K
+input_size: 224              # CIFAR-10 experiments can use the native size 32
+download: false              # Download missing CIFAR-10 files when true
+arch: resnet18                # torchvision name or net/<arch>.py:Network
+model_kwargs: {}              # num_classes is automatically selected for the dataset
+pretrained: false             # torchvision weights; custom models use resume
+dummy: false                 # Use FakeData with the selected dataset's sizes/classes
+
+# Data loading and training
+workers: 4                   # Worker count per node
+epochs: 90
+start_epoch: 0
+batch_size: 256               # Total per node; divided among local DDP processes
+lr: 0.1
+momentum: 0.9
+weight_decay: 0.0001
+lr_step_size: 30
+lr_gamma: 0.1
+seed: null                   # Integer for deterministic training, or null
+print_freq: 200
+
+# Checkpoints and evaluation
+save: /home/j/models_cla/     # Outputs go under <save>/<arch>-<dataset tag>[-dummy]/
+resume: ''                   # Checkpoint path; empty string starts fresh
+evaluate: false              # Run validation only
+
+# Devices and distributed training
+gpu: null                    # Fixed GPU ID, or null for automatic selection
+no_accel: false              # true forces CPU
+world_size: -1               # Node count for spawn; process count otherwise
+rank: -1                     # Node rank for spawn; process rank otherwise
+dist_url: tcp://224.66.41.62:23456
+dist_backend: nccl           # Use gloo for CPU DDP
+multiprocessing_distributed: false
+
+# torchrun automatically supplies world_size, rank, gpu and dist_url.
+# For the original spawn launch, set multiprocessing_distributed: true,
+# world_size: 1, rank: 0, gpu: null, dist_url: tcp://127.0.0.1:29500,
+# then run python main.py (or select an experiment with --config_path).
