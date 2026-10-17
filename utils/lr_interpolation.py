@@ -4,7 +4,10 @@ import math
 
 
 def epoch_lr_curve(settings):
-    """Return absolute LR(epoch). Outside keyframes, hold the endpoint LR."""
+    """Shared training/preview curve: completed fractional epoch -> scaled absolute LR.
+
+    Outside keyframes, hold the endpoint LR. Dataset size is irrelevant here.
+    """
     if settings.keys() - {'points', 'scale', 'interpolation'}:
         raise ValueError('Unknown LambdaLR interpolation settings')
     points = settings.get('points')

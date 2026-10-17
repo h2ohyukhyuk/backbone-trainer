@@ -17,7 +17,7 @@ def distributed_context(conf):
     return False, 0, 1
 
 
-def loader_options(conf, distributed):
+def loader_options(conf, distributed, *, training=False):
     batch_size, workers = conf['batch_size'], conf['workers']
     if distributed:
         processes_per_node = conf.get('processes_per_node', 1)
@@ -25,8 +25,12 @@ def loader_options(conf, distributed):
             raise ValueError('batch_size must be divisible by the number of local processes')
         batch_size //= processes_per_node
         workers = (workers + processes_per_node - 1) // processes_per_node
+    # A one-batch fast run should not create workers/prefetch queues that are abandoned early.
+    fast_training = training and conf.get('fast_mode', False)
+    if fast_training:
+        workers = 0
     return dict(batch_size=batch_size, num_workers=workers,
-                pin_memory=not conf['no_accel'] and torch.cuda.is_available(),
+                pin_memory=not fast_training and not conf['no_accel'] and torch.cuda.is_available(),
                 worker_init_fn=seed_worker if conf['seed'] is not None else None)
 
 

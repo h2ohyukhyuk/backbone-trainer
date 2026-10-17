@@ -225,7 +225,8 @@ def get_scheduler(opt, conf):
         total, epochs = conf['total_steps'], conf['epochs']
         if epochs <= 0 or total <= 0 or total % epochs:
             raise ValueError('interpolation requires positive epochs and whole steps per epoch')
-        steps_per_epoch = total // epochs
+        # Fast mode executes one batch per epoch; keep LR points in epoch coordinates.
+        steps_per_epoch = 1 if conf.get('fast_mode', False) else total // epochs
         base_lr = conf['LR']
         if base_lr <= 0:
             raise ValueError('LR must be positive for interpolation')

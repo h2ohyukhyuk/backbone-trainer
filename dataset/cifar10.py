@@ -24,7 +24,7 @@ def get_train_loader(conf):
         sampler = DistributedSampler(dataset, num_replicas=total_processes, rank=global_rank,
                                      shuffle=True, seed=conf['seed'] if conf['seed'] is not None else 0)
     return DataLoader(dataset, shuffle=sampler is None, sampler=sampler,
-                      **loader_options(conf, distributed))
+                      **loader_options(conf, distributed, training=True))
 
 
 def get_valid_loader(conf):

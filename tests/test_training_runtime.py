@@ -229,6 +229,22 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(options['batch_size'], 128)
         self.assertEqual(options['num_workers'], 2)
 
+    def test_fast_training_loader_avoids_early_worker_shutdown(self):
+        from dataset.common import loader_options
+        conf = {**self.conf, 'workers': 4, 'batch_size': 512, 'processes_per_node': 2,
+                'fast_mode': True, 'no_accel': False}
+        with patch('torch.cuda.is_available', return_value=True):
+            train = loader_options(conf, True, training=True)
+            valid = loader_options(conf, True)
+            normal = loader_options({**conf, 'fast_mode': False}, True, training=True)
+        self.assertEqual(train['batch_size'], 256)
+        self.assertEqual(train['num_workers'], 0)
+        self.assertFalse(train['pin_memory'])
+        self.assertEqual(valid['num_workers'], 2)
+        self.assertTrue(valid['pin_memory'])
+        self.assertEqual(normal['num_workers'], 2)
+        self.assertTrue(normal['pin_memory'])
+
     def test_only_global_rank_zero_prints(self):
         with patch('torch.distributed.is_initialized', return_value=True), patch('builtins.print') as output:
             with patch('torch.distributed.get_rank', return_value=1):

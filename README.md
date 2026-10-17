@@ -294,6 +294,7 @@ clearml-task \
   --repo git@github.com:h2ohyukhyuk/backbone-trainer.git \
   --branch main \
   --script main.py \
+  --skip-task-init \
   --docker clearml-local/torch:2.9.1-py3.12-cu128 \
   --queue defalult \
   --args config_path=experiments/config.yml
@@ -398,13 +399,13 @@ ClearML의 Models 또는 task의 output model에서 확인합니다.
 # Node 0 전용 agent가 수신하는 queue
 clearml-task --project APAG --name apag-node0 \
   --repo git@github.com:h2ohyukhyuk/backbone-trainer.git --branch main \
-  --script main.py --docker clearml-local/torch:2.9.1-py3.12-cu128 \
+  --script main.py --skip-task-init --docker clearml-local/torch:2.9.1-py3.12-cu128 \
   --queue apag-node0 --args config_path=experiments/APAGNet_node0.yml
 
 # Node 1 전용 agent가 수신하는 queue
 clearml-task --project APAG --name apag-node1 \
   --repo git@github.com:h2ohyukhyuk/backbone-trainer.git --branch main \
-  --script main.py --docker clearml-local/torch:2.9.1-py3.12-cu128 \
+  --script main.py --skip-task-init --docker clearml-local/torch:2.9.1-py3.12-cu128 \
   --queue apag-node1 --args config_path=experiments/APAGNet_node1.yml
 ```
 
@@ -662,7 +663,8 @@ python main.py --config_path experiments/config.yml --fast-mode
 또는 YAML에 `fast_mode: true`를 지정합니다(기본값 false).
 각 epoch에서 학습 배치 하나만 역전파·optimizer step한 뒤 전체 validation을 수행합니다.
 DDP에서는 각 rank가 배치 하나씩 처리합니다. epoch 수·검증·체크포인트 저장은 기존 설정을 따릅니다.
-LambdaLR는 실제 optimizer update 횟수만큼 진행하며 전체 epoch를 수행한 것처럼 앞당기지 않습니다.
+LambdaLR는 일반 학습에서 `len(train_loader)`를 epoch당 step 수로 자동 사용합니다.
+fast mode에서는 epoch당 1 step으로 환산하여 동일한 epoch/LR 포인트를 따릅니다.
 
 ### 이전 ClearML task의 last 체크포인트에서 재개
 
@@ -703,3 +705,21 @@ ClearML Scalars의 `epoch time (minutes)`에서 epoch별 `train`, `validation`, 
 CUDA 작업과 DDP rank를 구간 경계에서 동기화하여 실제 완료 시간을 측정합니다.
 validation 시간에는 검증뿐 아니라 체크포인트 저장과 ClearML 모델 업로드가 포함됩니다.
 모델 생성·데이터셋 준비 등 epoch 시작 전 초기화 시간은 포함하지 않습니다.
+
+### ClearML 초기화와 fast mode worker
+
+`clearml-task` 제출 시 `--skip-task-init`을 지정하세요. 프로젝트는 이미
+`remote_bootstrap()`에서 `Task.init(auto_connect_frameworks=False)`를 호출합니다.
+CLI의 기본 초기화가 먼저 삽입되면 PyTorch 자동 로깅이 켜져 `002.pt` 같은 epoch 파일까지
+추가 업로드될 수 있습니다. 새 task를 올바른 옵션으로 제출해야 하며 기존 실행에는 소급 적용되지 않습니다.
+fast mode의 학습 로더는 worker·pin-memory thread 없이 배치 하나를 준비하여 조기 iterator 종료를 피합니다.
+전체 validation과 일반 학습은 기존 worker 설정을 유지합니다.
+
+### LR 그래프와 학습의 공통 epoch 기준
+
+LambdaLR 학습과 plot은 동일한 `epoch_lr_curve()` Hermite 보간 함수를 사용합니다.
+일반 학습은 `완료 update 수 / len(train_loader)`, fast mode는 `완료 update 수 / 1`을
+epoch 좌표로 환산합니다. plot은 데이터셋·batch size를 읽지 않고 0부터 epochs까지
+epoch 좌표를 직접 보간합니다. 따라서 정상 update 시 같은 완료 epoch의 LR은 모두 같습니다.
+AMP overflow로 optimizer update를 건너뛰면 해당 scheduler step도 건너뜁니다.
+포인트 밖에서는 첫/마지막 LR을 유지하며 마지막 포인트는 자동으로 epochs에 재배치하지 않습니다.

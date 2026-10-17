@@ -10,9 +10,12 @@ clearml-task \
   --repo git@github.com:h2ohyukhyuk/backbone-trainer.git \
   --branch main \
   --script main.py \
+  --skip-task-init \
   --docker clearml-local/torch:2.9.1-py3.12-cu128 \
-  --queue defalult \
-  --args config_path=experiments/config.yml fast-mode
+  --docker_args="--shm-size=16g" \
+  --queue default \
+  --skip-task-init \
+  --args config_path=experiments/config.yml fast_mode=true
 
 
   python hpo-lr.py \
