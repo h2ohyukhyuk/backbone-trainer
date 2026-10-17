@@ -3,7 +3,7 @@ from pathlib import Path
 import unittest
 from unittest.mock import Mock, patch
 
-spec = importlib.util.spec_from_file_location('lr_hpo', Path(__file__).resolve().parents[1] / 'hpo-bo-lr.py')
+spec = importlib.util.spec_from_file_location('lr_hpo', Path(__file__).resolve().parents[1] / 'hpo_bo_lr.py')
 hpo = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(hpo)
 

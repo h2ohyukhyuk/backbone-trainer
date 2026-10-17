@@ -43,11 +43,11 @@ def read_config(path):
 def validate_config(config):
     """Validate settings without defining any default values in Python."""
     types = {
-        str: ('dataset', 'data', 'arch', 'save', 'resume', 'dist_url', 'dist_backend', 'lr_scheduler', 'OPT_NAME', 'amp_dtype'),
+        str: ('dataset', 'data', 'arch', 'save', 'resume', 'resume_task_id', 'dist_url', 'dist_backend', 'lr_scheduler', 'OPT_NAME', 'amp_dtype'),
         int: ('workers', 'epochs', 'start_epoch', 'batch_size', 'print_freq',
               'num_nodes', 'node_rank', 'seed', 'gpu', 'input_size'),
         float: ('LR', 'MOMENTUM', 'WEIGHT_DECAY'),
-        bool: ('evaluate', 'pretrained', 'no_accel', 'multiprocessing_distributed', 'dummy', 'download', 'AMS_GRAD', 'USE_LR_MULT', 'amp'),
+        bool: ('evaluate', 'pretrained', 'no_accel', 'multiprocessing_distributed', 'dummy', 'download', 'AMS_GRAD', 'USE_LR_MULT', 'amp', 'fast_mode'),
         dict: ('model_kwargs', 'SGD_KWARGS', 'ADAM_KWARGS', 'ADAMW_KWARGS', 'RMSPROP_KWARGS', 'ADADELTA_KWARGS',
                'STEPLR_KWARGS', 'LAMBDALR_KWARGS', 'MULTISTEPLR_KWARGS', 'POLYLR_KWARGS', 'AUGMENTATION'),
         list: ('LR_MULT_TARGET', 'LR_MULT_VAL'),
@@ -164,6 +164,10 @@ def parse_args(argv=None):
                         help='plot all schedulers, or list steplr lambdalr multisteplr polylr; no training')
     parser.add_argument('--steps-per-epoch', type=int,
                         help='legacy LR preview option; accepted but no longer needed for epoch-based curves')
+    parser.add_argument('--resume-task-id', '--resume_task_id', default=None,
+                        help='download previous ClearML task last.pt and restore its config and state')
+    parser.add_argument('--fast-mode', action='store_true',
+                        help='train only one batch per epoch, then run full validation')
     parser.add_argument('--hpo', action='store_true',
                         help='remote HPO only: apply Training hyperparameters over YAML values')
     args = parser.parse_args(argv)
@@ -188,13 +192,27 @@ def parse_args(argv=None):
                 raise ValueError(f'Unknown YAML keys: {sorted(unknown)}')
             config.update(overrides)
             validate_config(config)
-        from utils.clearml_utils import apply_hpo_overrides
-        config, hpo_overrides = apply_hpo_overrides(config, enabled=args.hpo)
+        from utils.clearml_utils import apply_hpo_overrides, restore_task_config
+        resume_task_id = args.resume_task_id if args.resume_task_id is not None else config['resume_task_id']
+        resume_model_id = None
+        if resume_task_id:
+            if args.hpo or args.fast_mode or args.plot_lr is not None:
+                raise ValueError('Task resume cannot be combined with --hpo, --fast-mode or --plot-lr; saved config is authoritative')
+            launch_node_rank = config['node_rank']
+            config, resume_model_id = restore_task_config(resume_task_id, read_config(default_path))
+            # A rank-zero checkpoint cannot provide another server's launch identity.
+            config['node_rank'] = launch_node_rank
+            hpo_overrides = {}
+        else:
+            config, hpo_overrides = apply_hpo_overrides(config, enabled=args.hpo)
+            if args.fast_mode:
+                config['fast_mode'] = True
         validate_config(config)
     except (OSError, ValueError, yaml.YAMLError) as exc:
         parser.error(str(exc))
     return argparse.Namespace(config_path=str(args.config_path), plot_lr=args.plot_lr,
-                              steps_per_epoch=args.steps_per_epoch, hpo=args.hpo, hpo_overrides=hpo_overrides, **config)
+                              steps_per_epoch=args.steps_per_epoch, hpo=args.hpo, hpo_overrides=hpo_overrides,
+                              _resume_model_id=resume_model_id, **config)
 
 
 def plot_learning_rate(args):
@@ -289,7 +307,7 @@ def create_model(args):
         raise ValueError(f'Unknown architecture {args.arch!r}; check torchvision or net/*.py')
     if args.pretrained and num_classes != 1000:
         raise ValueError('pretrained: true currently requires ImageNet; use pretrained: false for CIFAR-10')
-    return constructor(weights='DEFAULT' if args.pretrained else None, **kwargs)
+    return constructor(weights='DEFAULT' if args.pretrained and not args.resume else None, **kwargs)
 
 
 def main_ddp():
@@ -390,7 +408,6 @@ def main(args, device):
     save_dir = Path(args.output_dir)
     handlers = [logging.StreamHandler(sys.stdout)] if is_main else [logging.NullHandler()]
     if is_main:
-        save_run_config(args, save_dir)
         handlers.append(logging.FileHandler(save_dir / f'log-{args.arch}{suffix}.txt', mode='a'))
     logging.basicConfig(level=logging.INFO if is_main else logging.WARNING,
                         format='%(message)s', handlers=handlers, force=True)
@@ -398,12 +415,7 @@ def main(args, device):
                  args.node_rank, args.num_nodes, args.local_rank, args.processes_per_node,
                  args.global_rank, args.total_processes)
     logging.info('Output directory: %s', save_dir)
-    logging.info('Arguments: %s', vars(args))
-    if args.hpo:
-        logging.info('HPO config overrides: %s', args.hpo_overrides)
-
     from utils.clearml_utils import init_logger, init_best_model_registry
-    logger = init_logger(vars(args))
     model = create_model(args).to(device)
     if args.distributed:
         model = DistributedDataParallel(model, device_ids=[args.gpu] if device.type == 'cuda' else None)
@@ -418,6 +430,13 @@ def main(args, device):
     scheduler = get_scheduler(optimizer, {**conf, 'total_steps': len(train_loader) * args.epochs})
     scaler = torch.amp.GradScaler('cuda', enabled=args.amp and device.type == 'cuda' and args.amp_dtype == 'float16')
     best_acc1 = load_checkpoint(args, model, optimizer, scheduler, scaler)
+    # Checkpoint loading restores start_epoch; record the effective run settings afterward.
+    if is_main:
+        save_run_config(args, save_dir)
+    logging.info('Arguments: %s', vars(args))
+    if args.hpo:
+        logging.info('HPO config overrides: %s', args.hpo_overrides)
+    logger = init_logger(conf)
     trainer = Trainer(conf, train_loader, optimizer, scheduler, logger=logger, scaler=scaler)
     registry = init_best_model_registry(conf) if not args.evaluate else None
     validationer = Validationer(conf, optimizer=optimizer, scheduler=scheduler, best_acc=best_acc1,
@@ -428,12 +447,38 @@ def main(args, device):
 
     started = time.perf_counter()
     for epoch in range(args.start_epoch + 1, args.epochs + 1):
-        epoch_started = time.perf_counter()
-        trainer(model, epoch)
-        validationer(model, epoch, val_loader)
-        logging.info('Epoch %d: %.2f minutes; best Acc@1 %.3f', epoch,
-                     (time.perf_counter() - epoch_started) / 60, validationer.best_acc)
+        run_training_epoch(model, epoch, trainer, validationer, val_loader,
+                           device=device, distributed=args.distributed, logger=logger)
     logging.info('Total training time: %.2f hours', (time.perf_counter() - started) / 3600)
+
+
+
+def run_training_epoch(model, epoch, trainer, validationer, val_loader, *, device,
+                       distributed=False, logger=None):
+    """Measure completed work; validation includes checkpoint saves and uploads."""
+    def synchronize():
+        if device.type == 'cuda':
+            torch.cuda.synchronize(device)
+        if distributed:
+            dist.barrier()
+
+    synchronize()
+    started = time.perf_counter()
+    trainer(model, epoch)
+    synchronize()
+    train_finished = time.perf_counter()
+    validationer(model, epoch, val_loader)
+    synchronize()
+    finished = time.perf_counter()
+    minutes = {'train': (train_finished - started) / 60,
+               'validation': (finished - train_finished) / 60,
+               'total': (finished - started) / 60}
+    logging.info('Epoch %d time (minutes): train %.2f | validation %.2f | total %.2f',
+                 epoch, minutes['train'], minutes['validation'], minutes['total'])
+    if logger is not None:
+        for series, value in minutes.items():
+            logger.report_scalar('epoch time (minutes)', series, value, iteration=epoch)
+    return minutes
 
 
 def load_checkpoint(args, model, optimizer, scheduler, scaler=None):

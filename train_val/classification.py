@@ -68,7 +68,8 @@ class Trainer:
         self.scaler = scaler if scaler is not None else torch.amp.GradScaler(
             'cuda', enabled=self.amp_enabled and self.amp_dtype == torch.float16)
         self.report_freq = conf['print_freq']
-        self.train_step = conf['start_epoch'] * len(dataloader)
+        self.fast_mode = conf.get('fast_mode', False)
+        self.train_step = conf['start_epoch'] * (min(1, len(dataloader)) if self.fast_mode else len(dataloader))
         self.epoch = conf['start_epoch']
         self.batch_mix = build_batch_mix(conf)
         self.batch_mix_p = conf['AUGMENTATION']['batch']['p']
@@ -109,6 +110,9 @@ class Trainer:
                 losses.avg = (totals[0] / totals[1]).item()
                 self.report(index, losses, data_time, batch_time)
             self.train_step += 1
+            if self.fast_mode:
+                logging.info('Fast mode: one training batch completed; proceeding to validation')
+                break
             end = time.perf_counter()
         if self.scheduler is not None and not getattr(self.scheduler, "step_per_batch", False):
             self.scheduler.step()
@@ -216,6 +220,14 @@ class Validationer:
             state['scaler'] = self.scaler.state_dict()
         path = self.local_path / f'{self.epoch:03d}.pt'
         torch.save(state, path)
+        # Replace only a complete file so interruption cannot corrupt the previous local last.pt.
+        last_path = self.local_path / 'last.pt'
+        temporary = self.local_path / '.last.pt.tmp'
+        shutil.copyfile(path, temporary)
+        temporary.replace(last_path)
+        if self.is_main and self.registry is not None:
+            uri = self.registry.update_last(last_path, epoch=self.epoch, accuracy=acc1, accuracy_top5=acc5)
+            logging.info('ClearML last model uploaded: %s', uri)
         if self.is_best:
             best_path = self.local_path / 'model_best.pt'
             shutil.copyfile(path, best_path)

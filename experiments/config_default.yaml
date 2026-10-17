@@ -50,6 +50,7 @@ AUGMENTATION:
 # Data loading and training
 workers: 4                   # Worker count per node
 epochs: 90
+fast_mode: false            # One training batch per epoch, then full validation
 start_epoch: 0
 batch_size: 256               # Total per node; divided among local DDP processes
 
@@ -135,6 +136,7 @@ print_freq: 200
 
 # Checkpoints and evaluation
 save: /home/j/models_cla/     # Outputs go under <save>/<arch>-<dataset tag>[-dummy]/
+resume_task_id: ''            # Previous ClearML task ID; restores its last.pt config and training state
 resume: ''                   # Checkpoint path; empty string starts fresh
 evaluate: false              # Run validation only
 

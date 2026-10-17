@@ -77,7 +77,8 @@ def write_state(path, state):
 def validate_base(parameters):
     if parameters.get('Training/lr_scheduler') != 'lambdalr':
         raise ValueError('Base task must use lr_scheduler: lambdalr')
-    if (parameters.get('Training/resume') or parameters.get('Training/start_epoch') != 0
+    if (parameters.get('Training/resume') or parameters.get('Training/resume_task_id')
+            or parameters.get('Training/start_epoch') != 0
             or parameters.get('Training/evaluate') is not False):
         raise ValueError('HPO requires fresh training: resume empty, start_epoch 0, evaluate false')
     if parameters.get('Training/seed') is None:

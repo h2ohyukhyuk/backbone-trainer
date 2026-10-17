@@ -25,7 +25,7 @@ def reserve_run_directory(base):
 
 def resolved_config(conf):
     """Snapshot merged training settings without runtime-only attributes."""
-    excluded = {'hpo', 'hpo_overrides', 'config_path', 'plot_lr', 'steps_per_epoch', 'distributed', 'processes_per_node', 'total_processes', 'local_rank', 'global_rank', 'output_dir'}
+    excluded = {'_resume_model_id', 'hpo', 'hpo_overrides', 'config_path', 'plot_lr', 'steps_per_epoch', 'distributed', 'processes_per_node', 'total_processes', 'local_rank', 'global_rank', 'output_dir'}
     config = deepcopy({key: value for key, value in conf.items() if key not in excluded})
     if conf.get('multiprocessing_distributed', False):
         config['gpu'] = None  # Worker device assignment is not a user GPU override.

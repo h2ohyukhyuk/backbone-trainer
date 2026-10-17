@@ -67,6 +67,50 @@ class RuntimeTests(unittest.TestCase):
         main.load_checkpoint(args, self.model, self.opt, scheduler, trainer.scaler)
         self.assertEqual(args.start_epoch, 1)
 
+    def test_fast_mode_runs_one_backward_then_full_validation(self):
+        self.conf['fast_mode'] = True
+        scheduler = torch.optim.lr_scheduler.LambdaLR(self.opt, lambda step: 1)
+        scheduler.step_per_batch = True
+        trainer = runtime.Trainer(self.conf, self.loader, self.opt, scheduler)
+        with patch.object(self.opt, 'step', wraps=self.opt.step) as step:
+            trainer(self.model, 1)
+        self.assertEqual(step.call_count, 1)
+        self.assertEqual(trainer.train_step, 1)
+        self.assertEqual(scheduler.last_epoch, 1)
+        with patch.object(self.model, 'forward', wraps=self.model.forward) as forward:
+            runtime.Validationer(self.conf)(self.model, 1, self.loader)
+        self.assertEqual(forward.call_count, len(self.loader))
+        saved = torch.load(self.directory.name + '/tiny-cifar10-dummy/001.pt', weights_only=True)
+        self.assertTrue(saved['config']['fast_mode'])
+
+    def test_epoch_times_report_minutes_and_epoch_number(self):
+        from unittest.mock import Mock
+        logger = Mock()
+        trainer, validator, loader = Mock(), Mock(), object()
+        with patch.object(main.time, 'perf_counter', side_effect=[100., 220., 250.]):
+            minutes = main.run_training_epoch(self.model, 7, trainer, validator, loader,
+                                              device=torch.device('cpu'), logger=logger)
+        trainer.assert_called_once_with(self.model, 7)
+        validator.assert_called_once_with(self.model, 7, loader)
+        self.assertEqual(minutes, {'train': 2., 'validation': .5, 'total': 2.5})
+        self.assertEqual(logger.report_scalar.call_count, 3)
+        logger.report_scalar.assert_any_call('epoch time (minutes)', 'train', 2., iteration=7)
+        logger.report_scalar.assert_any_call('epoch time (minutes)', 'validation', .5, iteration=7)
+        logger.report_scalar.assert_any_call('epoch time (minutes)', 'total', 2.5, iteration=7)
+
+    def test_epoch_times_wait_for_cuda_and_distributed_work(self):
+        from unittest.mock import Mock
+        with patch.object(main.time, 'perf_counter', side_effect=[0., 60., 120.]), patch(
+                'torch.cuda.synchronize') as synchronize, patch('torch.distributed.barrier') as barrier:
+            main.run_training_epoch(self.model, 1, Mock(), Mock(), self.loader,
+                                    device=torch.device('cuda', 0), distributed=True)
+        self.assertEqual(synchronize.call_count, 3)
+        self.assertEqual(barrier.call_count, 3)
+
+    def test_fast_mode_cli_and_default(self):
+        self.assertFalse(main.parse_args([]).fast_mode)
+        self.assertTrue(main.parse_args(['--fast-mode']).fast_mode)
+
     def test_skipped_amp_update_does_not_advance_step_scheduler(self):
         class SkipScaler:
             def __init__(self): self.value = 8
@@ -193,6 +237,36 @@ class RuntimeTests(unittest.TestCase):
             with patch('torch.distributed.get_rank', return_value=0):
                 rank_zero_print('visible')
                 output.assert_called_once_with('visible')
+
+    def test_resume_epoch_is_recorded_after_checkpoint_restore(self):
+        args = types.SimpleNamespace(**self.conf)
+        args.lr_scheduler = 'steplr'
+        args.epochs = 1
+        main.configure_process_ranks(args, False, 0, environ={})
+        optimizer = torch.optim.AdamW(self.model.parameters(), lr=args.LR)
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 10, .5)
+        checkpoint = Path(self.directory.name) / 'resume.pt'
+        torch.save({'epoch': 1, 'state_dict': self.model.state_dict(),
+                    'optimizer': optimizer.state_dict(), 'scheduler': scheduler.state_dict(),
+                    'best_acc1': 50.0}, checkpoint)
+        args.resume = str(checkpoint)
+        recorded = []
+        def record(conf):
+            recorded.append(copy.deepcopy(conf))
+            return None
+        dataset = main.get_dataset_module(args.dataset)
+        with patch.object(main, 'create_model', return_value=self.model), patch.object(
+                dataset, 'get_train_loader', return_value=self.loader), patch.object(
+                dataset, 'get_valid_loader', return_value=self.loader), patch(
+                'utils.clearml_utils.init_logger', side_effect=record), patch(
+                'utils.clearml_utils.init_best_model_registry', return_value=None):
+            main.main(args, torch.device('cpu'))
+        resolved = main.read_config(Path(args.output_dir) / 'config.resolved.yml')
+        self.assertEqual(args.start_epoch, 1)
+        self.assertEqual(resolved['start_epoch'], 1)
+        self.assertEqual(recorded[0]['start_epoch'], 1)
+        self.assertEqual((Path(args.output_dir) / Path(args.config_path).name).read_bytes(),
+                         Path(args.config_path).read_bytes())
 
     def test_run_directories_and_config_copy(self):
         base = Path(self.directory.name) / 'run'

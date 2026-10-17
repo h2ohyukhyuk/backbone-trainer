@@ -7,7 +7,7 @@ from unittest.mock import Mock
 
 import importlib.util
 
-spec = importlib.util.spec_from_file_location('hpo', Path(__file__).resolve().parents[1] / 'hpo-grid-lr.py')
+spec = importlib.util.spec_from_file_location('hpo', Path(__file__).resolve().parents[1] / 'hpo_grid_lr.py')
 hpo = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(hpo)
 

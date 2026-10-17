@@ -353,9 +353,9 @@ HPO 값 수신은 학습 코드가 담당하며 `hpo-lr.py`가 단계별 Grid Se
 
 ```bash
 # 계획 확인
-python hpo-grid-lr.py --config-path experiments/config.yml
+python hpo_grid_lr.py --config-path experiments/config.yml
 # 완료된 기준 task를 복제하여 실행
-python hpo-grid-lr.py --execute --base-task-id TASK_ID --queue defalult
+python hpo_grid_lr.py --execute --base-task-id TASK_ID --queue defalult
 ```
 
 `--scale-values`로 scale 후보를 변경할 수 있습니다.
@@ -372,10 +372,11 @@ ClearML 기본 BO는 별도 파일
 ### Best model과 Model Registry
 
 ClearML 원격 실행의 global rank 0에서 validation Top-1 최고 기록을 갱신할 때만
-`model_best.pt`를 업로드합니다. epoch별 `.pt`는 `save` 경로에만 저장합니다.
+`model_best.pt`를 업로드합니다. 매 epoch 검증 완료 후 `last.pt`는 `<프로젝트>/<task 이름>/last`로 별도 업로드합니다.
+epoch별 번호가 붙은 `.pt`는 `save` 경로에만 저장합니다.
 모델 설명에는 해당 checkpoint의 validation Top-1, Top-5와 epoch를 기록합니다.
 모델 이름은 `<프로젝트>/<task 이름>/best`이며 해당 task의 output model로 연결됩니다.
-같은 task에서는 하나의 Registry 모델을 갱신하고, 다른 task는 별도 모델 ID를 가집니다.
+같은 task에서는 best와 last를 별도 Registry 모델로 갱신하고, 다른 task는 별도 모델 ID를 가집니다.
 따라서 같은 이름으로 실행한 실험끼리도 task/model ID로 구분됩니다.
 
 업로드 대상은 task의 output URI를 사용하며, 없으면 SDK 기본 저장소 또는 ClearML 파일 서버를 사용합니다.
@@ -649,3 +650,56 @@ python -m unittest discover -s tests -v
 ```
 
 GPU 최대 배치와 실제 CUDA AMP, ClearML 서버 연결은 대상 GPU·agent 환경에서 확인해야 합니다.
+
+### Fast mode
+
+학습·검증·저장 연결을 빠르게 확인하려면 다음과 같이 실행합니다.
+
+```bash
+python main.py --config_path experiments/config.yml --fast-mode
+```
+
+또는 YAML에 `fast_mode: true`를 지정합니다(기본값 false).
+각 epoch에서 학습 배치 하나만 역전파·optimizer step한 뒤 전체 validation을 수행합니다.
+DDP에서는 각 rank가 배치 하나씩 처리합니다. epoch 수·검증·체크포인트 저장은 기존 설정을 따릅니다.
+LambdaLR는 실제 optimizer update 횟수만큼 진행하며 전체 epoch를 수행한 것처럼 앞당기지 않습니다.
+
+### 이전 ClearML task의 last 체크포인트에서 재개
+
+매 epoch 검증 완료 후 `last.pt`를 로컬과 ClearML 저장소에 갱신합니다.
+best 모델은 별도 output model로 유지하며 마지막 체크포인트를 먼저 업로드합니다.
+
+```bash
+# 이전 task ID 하나로 config와 학습 상태 복원
+python main.py --resume-task-id PREVIOUS_TASK_ID
+```
+
+원격 제출에서는 기존 clearml-task 명령의 args를 다음과 같이 지정합니다.
+
+```bash
+--args resume_task_id=PREVIOUS_TASK_ID
+```
+
+또는 YAML에 `resume_task_id: PREVIOUS_TASK_ID`를 지정합니다.
+모델·배치·전체 epoch 수·LR·augmentation·data/save·분산 설정은 last.pt의 config에서 가져옵니다.
+서버 식별자인 node_rank는 현재 YAML/launcher 값을 사용하며 torchrun의 rank는 환경변수로 결정합니다.
+모델 가중치·optimizer·scheduler·AMP scaler·best Top-1·완료 epoch도 복원합니다.
+기존 YAML이나 Training UI 값으로 학습 설정을 덮어쓰지 않습니다.
+새 실행의 config.resolved.yml과 ClearML Training에는 복원된 설정을 기록하고,
+Resume 항목에는 원본 task/model ID를 기록합니다. 새 task에서 이어서 실행하며 이전 task 기록은 보존합니다.
+
+last.pt는 자동 다운로드하므로 모델 폴더 마운트는 필요 없습니다. 데이터 접근과 ClearML 저장소
+접근은 필요하며 같은 코드 버전·장치 구성·경로를 사용할 것을 전제로 합니다.
+전체 학습 epoch 수는 이전 설정 그대로이므로 이미 끝난 실험은 추가 epoch를 실행하지 않습니다.
+중간 epoch의 진행분은 복구하지 않으며 마지막 업로드가 끝난 epoch 다음부터 시작합니다.
+worker RNG/데이터 로더 진행 상태는 저장하지 않으므로 중단 없는 실행과 비트 단위 동일 결과는 보장하지 않습니다.
+이 기능 이전 task에 last 모델이 없으면 명확한 오류로 중단하며 best로 대체하지 않습니다.
+현재 소스 코드까지 이전 task 버전으로 자동 교체하지는 않습니다.
+
+### Epoch 소요 시간 그래프
+
+ClearML Scalars의 `epoch time (minutes)`에서 epoch별 `train`, `validation`, `total`을
+분 단위로 비교할 수 있습니다. global rank 0만 리포트하며 로컬 실행은 로그에 기록합니다.
+CUDA 작업과 DDP rank를 구간 경계에서 동기화하여 실제 완료 시간을 측정합니다.
+validation 시간에는 검증뿐 아니라 체크포인트 저장과 ClearML 모델 업로드가 포함됩니다.
+모델 생성·데이터셋 준비 등 epoch 시작 전 초기화 시간은 포함하지 않습니다.

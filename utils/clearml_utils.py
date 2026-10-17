@@ -64,6 +64,43 @@ def apply_hpo_overrides(config, enabled=False):
     return result, changed
 
 
+def restore_task_config(task_id, defaults):
+    """Download an explicit last model and restore its config before model/DDP setup."""
+    from copy import deepcopy
+    from pathlib import Path
+    import torch
+    from clearml import Task
+    source = Task.get_task(task_id=task_id)
+    status = getattr(source, 'status', None)
+    status = str(getattr(status, 'value', status)).split('.')[-1].lower()
+    if status in ('in_progress', 'queued'):
+        raise ValueError('Stop the source task before resuming its last checkpoint')
+    models = [model for model in source.models['output']
+              if (getattr(model, 'name', '') or '').endswith('/last')
+              or 'last' in (getattr(model, 'tags', None) or [])]
+    if len(models) != 1:
+        raise ValueError(f'Task {task_id} must have exactly one last model; found {len(models)}. '
+                         'Best models are not used for resume.')
+    model = models[0]
+    path = model.get_local_copy(raise_on_error=True, force_download=True)
+    if not path or not Path(path).is_file():
+        raise ValueError(f'Task {task_id}: last checkpoint could not be downloaded')
+    checkpoint = torch.load(path, map_location='cpu', weights_only=True)
+    required = {'config', 'epoch', 'state_dict', 'optimizer', 'scheduler', 'scaler', 'best_acc1'}
+    if not isinstance(checkpoint, dict) or not required <= checkpoint.keys():
+        raise ValueError('Last checkpoint is missing config or resumable training state')
+    if not isinstance(checkpoint['config'], dict) or type(checkpoint['epoch']) is not int or checkpoint['epoch'] < 0:
+        raise ValueError('Last checkpoint has invalid config or epoch')
+    restored = deepcopy(defaults)
+    restored.update(deepcopy(checkpoint['config']))
+    for field in ('arch', 'dataset'):
+        if field in checkpoint and checkpoint[field] != restored[field]:
+            raise ValueError(f'Last checkpoint {field} does not match its config')
+    restored.update(resume=str(Path(path).resolve()), resume_task_id=task_id,
+                    start_epoch=checkpoint['epoch'])
+    return restored, model.id
+
+
 def init_logger(conf):
     if conf.get('distributed', False) and conf['global_rank'] != 0:
         return None
@@ -83,40 +120,49 @@ def init_logger(conf):
         return value
     from utils.run_output import resolved_config
     task.connect(string_keys(resolved_config(conf)), name='Training', ignore_remote_overrides=True)
+    if conf.get('_resume_model_id'):
+        task.connect({'source_task_id': conf['resume_task_id'], 'source_model_id': conf['_resume_model_id']},
+                     name='Resume', ignore_remote_overrides=True)
     return task.get_logger()
 
 
 class BestModelRegistry:
-    """Maintain one output model per task; upload only improved checkpoints."""
+    """Maintain separate best and last output models, with synchronous uploads."""
     def __init__(self, task, conf):
         self.task = task
         self.conf = conf
         self.model = None
+        self.last_model = None
 
-    def update(self, checkpoint, *, epoch, accuracy, accuracy_top5):
-        if self.model is None:
+    def _update(self, kind, checkpoint, *, epoch, accuracy, accuracy_top5):
+        attribute = 'model' if kind == 'best' else 'last_model'
+        model = getattr(self, attribute)
+        if model is None:
             from clearml import OutputModel
             import yaml
-            # Without a destination the SDK may register only a container-local path.
-            # True resolves the configured default storage or the ClearML file server.
             if not self.task.output_uri:
                 self.task.output_uri = True
-            self.model = OutputModel(
+            model = OutputModel(
                 task=self.task, framework='PyTorch',
-                name=f'{self.task.get_project_name()}/{self.task.name}/best',
-                tags=['best', self.conf['arch'], self.conf['dataset']],
+                name=f'{self.task.get_project_name()}/{self.task.name}/{kind}',
+                tags=[kind, self.conf['arch'], self.conf['dataset']],
                 config_text=yaml.safe_dump(self.conf, sort_keys=False))
-        self.model.comment = (f'Best validation Top-1: {accuracy:.6f}%; '
-                              f'Top-5: {accuracy_top5:.6f}%; epoch: {epoch}')
-        # Finish the upload before returning: the file may be replaced next epoch,
-        # or the container may be removed as soon as training exits.
-        uri = self.model.update_weights(
-            weights_filename=str(checkpoint), target_filename='model_best.pt',
-            iteration=epoch, auto_delete_file=False, async_enable=False,
-            update_comment=False)
+            setattr(self, attribute, model)
+        model.comment = (f'{"Best" if kind == "best" else "Last"} validation Top-1: {accuracy:.6f}%; '
+                         f'Top-5: {accuracy_top5:.6f}%; epoch: {epoch}')
+        uri = model.update_weights(
+            weights_filename=str(checkpoint),
+            target_filename='model_best.pt' if kind == 'best' else 'last.pt',
+            iteration=epoch, auto_delete_file=False, async_enable=False, update_comment=False)
         if not uri:
-            raise RuntimeError('ClearML best-model upload returned no storage URI')
+            raise RuntimeError(f'ClearML {kind}-model upload returned no storage URI')
         return uri
+
+    def update(self, checkpoint, *, epoch, accuracy, accuracy_top5):
+        return self._update('best', checkpoint, epoch=epoch, accuracy=accuracy, accuracy_top5=accuracy_top5)
+
+    def update_last(self, checkpoint, *, epoch, accuracy, accuracy_top5):
+        return self._update('last', checkpoint, epoch=epoch, accuracy=accuracy, accuracy_top5=accuracy_top5)
 
 
 def init_best_model_registry(conf):
