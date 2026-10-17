@@ -48,7 +48,7 @@ AUGMENTATION:
     mixup_weight: 0.5            # Conditional MixUp probability; CutMix gets 1-weight
 
 # Data loading and training
-workers: 4                   # Worker count per node
+workers: 12                   # Worker count per node
 epochs: 90
 fast_mode: false            # One training batch per epoch, then full validation
 start_epoch: 0
