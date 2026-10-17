@@ -22,7 +22,7 @@ from torch.nn.parallel import DataParallel, DistributedDataParallel
 
 from dataset.augmentation import build_batch_mix
 from utils.train_utils import AverageMeter
-from utils.run_output import resolved_config
+from utils.run_output import resolved_config, is_clearml_run
 
 
 def get_criterion(conf):
@@ -218,19 +218,19 @@ class Validationer:
             state['scheduler'] = self.scheduler.state_dict()
         if self.scaler is not None:
             state['scaler'] = self.scaler.state_dict()
-        path = self.local_path / f'{self.epoch:03d}.pt'
-        torch.save(state, path)
-        # Replace only a complete file so interruption cannot corrupt the previous local last.pt.
         last_path = self.local_path / 'last.pt'
         temporary = self.local_path / '.last.pt.tmp'
-        shutil.copyfile(path, temporary)
+        torch.save(state, temporary)
         temporary.replace(last_path)
+        if not is_clearml_run():
+            # Epoch archives are local-run outputs only; remote runs stage last/best for upload.
+            shutil.copyfile(last_path, self.local_path / f'{self.epoch:03d}.pt')
         if self.is_main and self.registry is not None:
             uri = self.registry.update_last(last_path, epoch=self.epoch, accuracy=acc1, accuracy_top5=acc5)
             logging.info('ClearML last model uploaded: %s', uri)
         if self.is_best:
             best_path = self.local_path / 'model_best.pt'
-            shutil.copyfile(path, best_path)
+            shutil.copyfile(last_path, best_path)
             if self.is_main and self.registry is not None:
                 uri = self.registry.update(best_path, epoch=self.epoch, accuracy=self.best_acc, accuracy_top5=acc5)
                 logging.info('ClearML best model uploaded: %s', uri)

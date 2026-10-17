@@ -135,7 +135,7 @@ seed: 1024                   # Integer for deterministic training, or null
 print_freq: 200
 
 # Checkpoints and evaluation
-save: /home/j/models_cla/     # Outputs go under <save>/<arch>-<dataset tag>[-dummy]/
+save: /home/j/models_cla/     # LOCAL runs only; ignored by ClearML remote runs
 resume_task_id: ''            # Previous ClearML task ID; restores its last.pt config and training state
 resume: ''                   # Checkpoint path; empty string starts fresh
 evaluate: false              # Run validation only

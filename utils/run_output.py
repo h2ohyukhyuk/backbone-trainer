@@ -3,9 +3,14 @@ from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 import shutil
+import os
 from zoneinfo import ZoneInfo
 
 import yaml
+
+
+def is_clearml_run():
+    return bool(os.environ.get('CLEARML_TASK_ID'))
 
 
 def reserve_run_directory(base):

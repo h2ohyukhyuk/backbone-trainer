@@ -73,7 +73,7 @@ python main.py --config_path experiments/config.yml
 | `OPT_NAME` / `LR` | 옵티마이저 / 기준 학습률 |
 | `lr_scheduler` | 스케줄러 선택 |
 | `amp` / `amp_dtype` | CUDA 혼합 정밀도 설정 |
-| `save` / `resume` | 결과 루트 / 재개할 체크포인트 |
+| `save` / `resume` | 로컬 실행 결과 루트 / 재개할 체크포인트 |
 | `seed` | 정수 또는 `null` |
 | `dummy` | `true`이면 FakeData 사용 |
 
@@ -374,7 +374,7 @@ ClearML 기본 BO는 별도 파일
 
 ClearML 원격 실행의 global rank 0에서 validation Top-1 최고 기록을 갱신할 때만
 `model_best.pt`를 업로드합니다. 매 epoch 검증 완료 후 `last.pt`는 `<프로젝트>/<task 이름>/last`로 별도 업로드합니다.
-epoch별 번호가 붙은 `.pt`는 `save` 경로에만 저장합니다.
+epoch별 번호가 붙은 `.pt`는 로컬 실행에서만 `save` 경로에 저장합니다.
 모델 설명에는 해당 checkpoint의 validation Top-1, Top-5와 epoch를 기록합니다.
 모델 이름은 `<프로젝트>/<task 이름>/best`이며 해당 task의 output model로 연결됩니다.
 같은 task에서는 best와 last를 별도 Registry 모델로 갱신하고, 다른 task는 별도 모델 ID를 가집니다.
@@ -544,7 +544,7 @@ Train accuracy는 계산하지 않습니다. 지표는 epoch별로 기록하며,
 
 ### 저장 위치
 
-기본 저장 루트는 `save: /home/j/models_cla/`입니다. 일반 로그와 print, config 복사,
+로컬 실행의 기본 저장 루트는 `save: /home/j/models_cla/`입니다. ClearML 원격 실행은 이 값을 사용하지 않습니다. 일반 로그와 print, config 복사,
 체크포인트 저장 및 ClearML scalar 기록은 global rank 0(Node 0의 첫 GPU)에서만 실행합니다.
 
 ```text
@@ -723,3 +723,20 @@ epoch 좌표로 환산합니다. plot은 데이터셋·batch size를 읽지 않�
 epoch 좌표를 직접 보간합니다. 따라서 정상 update 시 같은 완료 epoch의 LR은 모두 같습니다.
 AMP overflow로 optimizer update를 건너뛰면 해당 scheduler step도 건너뜁니다.
 포인트 밖에서는 첫/마지막 LR을 유지하며 마지막 포인트는 자동으로 epochs에 재배치하지 않습니다.
+
+### 로컬과 ClearML 저장 경로 분리
+
+`save`는 로컬 Python 학습 전용입니다.
+
+| 실행 방식 | 로그·config | 모델 저장 |
+|---|---|---|
+| 로컬 | save 아래 고유 실행 폴더 | epoch별 .pt, last.pt, model_best.pt |
+| ClearML Agent | ClearML Console·Training 설정 | ClearML 저장소의 last/best output model |
+
+ClearML 원격 실행은 `CLEARML_TASK_ID`로 구분하며 `save` 경로를 생성하거나 사용하지 않습니다.
+업로드에 필요한 파일 두 개만 시스템 임시 폴더(`/tmp/backbone-clearml-*`)에 생성하고
+동기 업로드 후 실행 종료 시 임시 폴더를 정리합니다. config 복사본과 별도 파일 로그,
+epoch별 번호 체크포인트는 원격 실행에서 생성하지 않습니다.
+.pt 내부 config와 ClearML Training 설정에는 복원에 필요한 전체 설정이 유지됩니다.
+모델 폴더 마운트 없이 last task ID 재개가 가능하며 데이터셋 접근은 필요합니다.
+`save` 값이 기록된 config에 있어도 ClearML 실행의 출력 경로로 사용하지 않습니다.

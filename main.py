@@ -395,26 +395,42 @@ def main_worker(local_rank, args):
 
 
 def main(args, device):
+    """Local persistent outputs and ClearML temporary staging have separate lifetimes."""
+    from contextlib import ExitStack
+    import tempfile
+    from utils.run_output import is_clearml_run, reserve_run_directory
+    is_main = not args.distributed or args.global_rank == 0
+    with ExitStack() as resources:
+        output = [None]
+        if is_main:
+            if is_clearml_run():
+                output[0] = resources.enter_context(tempfile.TemporaryDirectory(prefix='backbone-clearml-'))
+            else:
+                dataset_tag = 'imgn' if args.dataset == 'image_net_1K' else args.dataset
+                suffix = f'-{dataset_tag}' + ('-dummy' if args.dummy else '')
+                output[0] = str(reserve_run_directory(Path(args.save) / (args.arch + suffix)))
+        if args.distributed:
+            dist.broadcast_object_list(output, src=0)
+        args.output_dir = output[0]
+        _run_training(args, device)
+
+
+def _run_training(args, device):
+    from utils.run_output import is_clearml_run, save_run_config
+    remote = is_clearml_run()
     is_main = not args.distributed or args.global_rank == 0
     dataset_tag = 'imgn' if args.dataset == 'image_net_1K' else args.dataset
     suffix = f'-{dataset_tag}' + ('-dummy' if args.dummy else '')
-    from utils.run_output import reserve_run_directory, save_run_config
-    output = [None]
-    if is_main:
-        output[0] = str(reserve_run_directory(Path(args.save) / (args.arch + suffix)))
-    if args.distributed:
-        dist.broadcast_object_list(output, src=0)
-    args.output_dir = output[0]
     save_dir = Path(args.output_dir)
     handlers = [logging.StreamHandler(sys.stdout)] if is_main else [logging.NullHandler()]
-    if is_main:
+    if is_main and not remote:
         handlers.append(logging.FileHandler(save_dir / f'log-{args.arch}{suffix}.txt', mode='a'))
     logging.basicConfig(level=logging.INFO if is_main else logging.WARNING,
                         format='%(message)s', handlers=handlers, force=True)
     logging.info('Ranks: node_rank=%d/%d local_rank=%d/%d global_rank=%d/%d',
                  args.node_rank, args.num_nodes, args.local_rank, args.processes_per_node,
                  args.global_rank, args.total_processes)
-    logging.info('Output directory: %s', save_dir)
+    logging.info('%s: %s', 'ClearML temporary checkpoint directory' if remote else 'Local output directory', save_dir)
     from utils.clearml_utils import init_logger, init_best_model_registry
     model = create_model(args).to(device)
     if args.distributed:
@@ -431,7 +447,7 @@ def main(args, device):
     scaler = torch.amp.GradScaler('cuda', enabled=args.amp and device.type == 'cuda' and args.amp_dtype == 'float16')
     best_acc1 = load_checkpoint(args, model, optimizer, scheduler, scaler)
     # Checkpoint loading restores start_epoch; record the effective run settings afterward.
-    if is_main:
+    if is_main and not remote:
         save_run_config(args, save_dir)
     logging.info('Arguments: %s', vars(args))
     if args.hpo:
