@@ -39,7 +39,7 @@ CIFAR-10을 `./data/cifar10`에 다운로드하고 32×32 이미지로 학습합
 ### ImageNet-1K + 멀티 GPU + ClearML
 
 ```bash
-python main.py --config_path experiments/APAGNet.yml
+python main.py --config_path experiments/config.yml
 ```
 
 이 설정은 **현재 컴퓨터의 모든 visible GPU에 DDP 프로세스를 하나씩 실행**합니다.
@@ -55,7 +55,7 @@ python main.py --config_path experiments/APAGNet.yml
 **다른 실험 YAML을 상속하지는 않습니다.**
 
 ```bash
-python main.py --config_path experiments/APAGNet.yml
+python main.py --config_path experiments/config.yml
 ```
 
 중첩 딕셔너리는 구역 전체가 교체됩니다. 예를 들어 `LAMBDALR_KWARGS`를 수정할 때는
@@ -118,6 +118,24 @@ download: true
 두 데이터셋 모두 평균 `[0.485, 0.456, 0.406]`, 표준편차 `[0.229, 0.224, 0.225]`로 정규화합니다.
 ImageNet 데이터는 직접 준비하며 `download`는 CIFAR-10에만 적용합니다.
 
+### Augmentation 조절
+
+`config_default.yaml`의 `AUGMENTATION`에서 조절합니다. 실제 학습에 적용된 값은
+ClearML `Training/AUGMENTATION/...`과 `.pt`의 `config.AUGMENTATION`에 함께 기록됩니다.
+
+| 구역 | 주요 설정 |
+|---|---|
+| `image_net_1K` | crop 면적·종횡비, flip 확률, RandAugment, RandomErasing |
+| `cifar10` | native 32x32 crop 사용·padding, flip 확률, RandAugment, RandomErasing |
+| `batch` | 적용 데이터셋, 전체 적용 확률, MixUp/CutMix alpha와 선택 비율 |
+
+- `horizontal_flip_p: 0`, `random_erasing_p: 0`으로 해당 변환을 끕니다.
+- `randaugment_enabled: false`로 RandAugment를 끕니다.
+- `batch.p: 0`으로 MixUp/CutMix를 끕니다. `mixup_weight: 1`은 MixUp만, `0`은 CutMix만 사용합니다.
+- 기본 batch 확률은 0.1, 선택 비율은 0.5이므로 MixUp 5%, CutMix 5%, 혼합 없음 90%입니다.
+- validation에는 augmentation을 적용하지 않으며 `dummy` 데이터에서도 augmentation을 생략합니다.
+- 실험 YAML에서 덮어쓸 때는 `AUGMENTATION` 구역 전체를 복사해 수정하세요.
+
 ## GPU 및 노드 구성
 
 ### 실행 방식 선택
@@ -148,7 +166,7 @@ batch_size: 256
 ```
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 python main.py --config_path experiments/APAGNet.yml
+CUDA_VISIBLE_DEVICES=0,1 python main.py --config_path experiments/config.yml
 ```
 
 두 GPU에 프로세스를 하나씩 띄우고 GPU당 128개 샘플로 학습합니다.
@@ -278,7 +296,7 @@ clearml-task \
   --script main.py \
   --docker clearml-local/torch:2.9.1-py3.12-cu128 \
   --queue defalult \
-  --args config_path=experiments/APAGNet.yml
+  --args config_path=experiments/config.yml
 ```
 
 실행 준비 사항:
@@ -296,6 +314,60 @@ clearml-task \
 ```
 
 `requirements.txt`는 Docker에 맞춰 torch 2.9.1 / torchvision 0.24.1을 사용합니다.
+
+### HPO 실행에서만 원격 hyperparameter 적용
+
+일반 원격 실행과 로컬 실행은 YAML을 기준으로 합니다. 명시적으로 `--hpo`를 켠 원격 실행에서만
+ClearML의 `Training/...` 값을 내부 config 복사본에 반영합니다. 원본 YAML 파일은 수정하지 않습니다.
+예를 들어 HPO 기준 task를 제출할 때 기존 명령의 인자에 다음을 사용합니다.
+
+```text
+--args config_path=experiments/config.yml hpo=true
+```
+
+HPO가 복제하는 task에는 `Args/hpo: true`가 유지되어야 합니다.
+탐색 변수는 예를 들어 `Training/LAMBDALR_KWARGS/points/15`,
+`Training/LAMBDALR_KWARGS/points/45`로 지정합니다. 숫자 epoch 키도 보존합니다.
+학습·optimizer·스케줄러·augmentation 설정을 탐색할 수 있으며 데이터/저장 경로와 rank·통신 설정은
+YAML/실행기가 계속 관리합니다. 일반 task에서는 UI에서 값을 바꿔도 학습에 반영되지 않습니다.
+
+적용된 최종 config를 다시 검증하고 ClearML hyperparameters, `config.resolved.yml`, `.pt`의 `config`와
+Registry 설정에 기록합니다. 원본 config 복사본은 수정 전 YAML이므로 HPO 실행의 실제 값은
+`config.resolved.yml`을 확인하세요. 로그에도 변경 전후 값을 기록합니다.
+DDP spawn 이전에 적용하고 torchrun의 다른 rank는 task를 읽기만 합니다.
+HPO 값 수신은 학습 코드가 담당하며 `hpo-lr.py`가 단계별 Grid Search를 실행합니다.
+
+### 단계별 LR Grid Search
+
+`hpo-lr.py`는 단계별 Grid Search이며 이전 실험과 중복되는 설정은 재사용합니다.
+
+| 단계 | 탐색 값 | 새 학습 수 |
+|---|---|---|
+| 1 | scale `[0.1, 0.325, 0.55, 0.775, 1.0]` | 최대 5 |
+| 2 | 15·20 epoch LR 각각 `[0.008, 0.007, 0.006]` | 최대 8 |
+| 3 | 43·48 epoch LR 각각 `[0.001, 0.002, 0.003]` | 최대 8 |
+
+2단계와 3단계의 기준값이 후보에 포함되면 최대 21회입니다.
+각 단계의 최고 validation Top-1 설정을 다음 단계에 고정합니다.
+각 trial은 같은 seed로 처음부터 학습하며 이전 가중치는 이어받지 않습니다.
+
+```bash
+# 계획 확인
+python hpo-grid-lr.py --config-path experiments/config.yml
+# 완료된 기준 task를 복제하여 실행
+python hpo-grid-lr.py --execute --base-task-id TASK_ID --queue defalult
+```
+
+`--scale-values`로 scale 후보를 변경할 수 있습니다.
+진행 상태는 `outputs/hpo/lr_search.json`에 저장하며 같은 명령으로 재개합니다.
+다른 기준 task나 탐색 조건을 사용할 때는 별도 `--state`를 지정하세요.
+실제 실행은 기준 task의 코드·설정·Docker를 복제하며 현재 controller는 단일 노드용입니다.
+기준 task는 `lambdalr`, 명시적인 seed, 빈 resume, start_epoch 0, evaluate false여야 합니다.
+15/20/43/48 point가 있어야 하며 controller는 `Args/hpo=true`를 자동 지정합니다.
+controller는 실행 상태를 유지해야 하고 완료 결과는 `hpo_results` artifact로 기록합니다.
+
+ClearML 기본 BO는 별도 파일
+`/home/j/projects_mldl/backbone-trainer/hpo-bo-lr.py`를 사용합니다.
 
 ### Best model과 Model Registry
 
@@ -402,7 +474,7 @@ LR_MULT_VAL: [10.0]
 | 선택값 | 설정 구역 / 키 | 갱신 단위 |
 |---|---|---|
 | `steplr` | `STEPLR_KWARGS`: `step_size`, `gamma` | epoch |
-| `lambdalr` | `LAMBDALR_KWARGS`: `points`, `interpolation`, `tangents` | optimizer update |
+| `lambdalr` | `LAMBDALR_KWARGS`: `points`, `scale`, `interpolation` | optimizer update |
 | `multisteplr` | `MULTISTEPLR_KWARGS`: `milestones`, `gamma` | epoch |
 | `polylr` | `POLYLR_KWARGS`: `power` | epoch |
 
@@ -415,6 +487,7 @@ PolyLR은 `LR × (1 - 완료 epoch / epochs)^power`로 0까지 감소합니다.
 ```yaml
 lr_scheduler: lambdalr
 LAMBDALR_KWARGS:
+  scale: 1.0
   points:
     0: 0.0001
     1: 0.01
@@ -422,26 +495,27 @@ LAMBDALR_KWARGS:
     30: 0.005
     60: 0.001
     90: 0.0001
-  interpolation: hermite    # 또는 catmullrom
-  tangents: []
+  interpolation: hermite    # Hermite만 지원
 ```
 
+- `scale`은 전체 LR 곡선 배율입니다. `0.5`이면 모든 point와 구간 LR이 절반, `2.0`이면 두 배입니다.
+- 배율은 유한한 양수이며 생략하면 1입니다. 원본 `points`는 바꾸지 않고 계산 시 적용합니다.
+- HPO 탐색 변수는 `Training/LAMBDALR_KWARGS/scale`입니다. config에는 기준 points와 실제 scale을 기록합니다.
 - `points`의 숫자 키는 완료한 epoch, 값은 절대 LR입니다. 소수 epoch도 지원하며 내부에서 정렬합니다.
 - 매 optimizer 업데이트에서 epoch 위치를 계산해 보간합니다. 앞부분 점으로 warmup을 표현합니다.
 - 첫 점 이전과 마지막 점 이후에는 해당 끝점 LR을 유지합니다.
-- Hermite `tangents`는 epoch 오름차순의 LR/epoch 기울기이며 `[]`이면 모두 0입니다.
-- Catmull–Rom은 인접 점의 epoch 간격을 반영한 중앙 차분 기울기, 양끝은 단측 기울기를 사용합니다.
-- 음수 보간값은 0으로 제한합니다. 양의 overshoot는 허용합니다.
-- 모듈별 LR 배율은 기준 곡선에 곱해집니다. `hemit`, `catmulrome` 별칭도 지원합니다.
+- 각 point의 기울기는 항상 0으로 고정합니다. 사용자 기울기 설정은 없습니다.
+- 구간은 양 끝 LR 사이에서 단조롭게 보간하므로 overshoot가 생기지 않습니다.
+- 모듈별 LR 배율은 기준 곡선에 곱해집니다.
 
 ### 학습 없이 LR 그래프 저장
 
 ```bash
 # 네 스케줄러 모두 비교
-python main.py --config_path experiments/APAGNet.yml --plot-lr
+python main.py --config_path experiments/config.yml --plot-lr
 
 # 선택한 스케줄러만 비교
-python main.py --config_path experiments/APAGNet.yml --plot-lr multisteplr lambdalr
+python main.py --config_path experiments/config.yml --plot-lr multisteplr lambdalr
 ```
 
 결과는 **`experiments/APAGNet_lr_curve.png`**입니다.

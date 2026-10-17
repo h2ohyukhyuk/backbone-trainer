@@ -10,6 +10,7 @@ processes without changing the configuration dictionary.
 from pathlib import Path
 from torch.utils.data import DataLoader, DistributedSampler, Subset
 
+from dataset.augmentation import build_train_transform
 from dataset.common import distributed_context, loader_options
 
 
@@ -24,14 +25,7 @@ def get_train_loader(conf):
     if conf['dummy']:
         dataset = datasets.FakeData(1281167, (3, size, size), NUM_CLASSES, transforms.ToTensor())
     else:
-        dataset = datasets.ImageFolder(Path(conf['data']) / 'train', transforms.Compose([
-            transforms.RandomResizedCrop(size),
-            transforms.RandomHorizontalFlip(),
-            transforms.RandAugment(num_ops=2, magnitude=9),
-            transforms.ToTensor(),
-            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-            transforms.RandomErasing(p=0.1),
-        ]))
+        dataset = datasets.ImageFolder(Path(conf['data']) / 'train', build_train_transform(conf))
     distributed, global_rank, total_processes = distributed_context(conf)
     sampler = None
     if distributed:

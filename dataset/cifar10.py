@@ -9,6 +9,7 @@ on shared storage; this also supports separate dataset directories per node.
 import torch.distributed as dist
 from torch.utils.data import DataLoader, DistributedSampler, Subset
 
+from dataset.augmentation import build_train_transform
 from dataset.common import distributed_context, loader_options
 
 
@@ -41,8 +42,7 @@ def _build_dataset(conf, train):
     if conf['dummy']:
         return datasets.FakeData(50000 if train else 10000, (3, size, size),
                                  NUM_CLASSES, transforms.ToTensor())
-    augmentation = [transforms.RandomCrop(32, padding=4), transforms.RandomHorizontalFlip()] if train else []
-    transform = transforms.Compose(augmentation + [
+    transform = build_train_transform(conf) if train else transforms.Compose([
         transforms.Resize((size, size)),
         transforms.ToTensor(),
         # Keep the normalization used by the previous CIFAR-10 loader.

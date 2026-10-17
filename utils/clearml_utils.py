@@ -9,6 +9,61 @@ def remote_bootstrap():
         Task.init(auto_connect_frameworks=False)
 
 
+# Execution paths and distributed identities always come from YAML/launcher.
+HPO_CONFIG_KEYS = {
+    'arch', 'model_kwargs', 'epochs', 'batch_size', 'seed', 'amp', 'amp_dtype',
+    'OPT_NAME', 'LR', 'MOMENTUM', 'WEIGHT_DECAY', 'AMS_GRAD',
+    'USE_LR_MULT', 'LR_MULT_TARGET', 'LR_MULT_VAL',
+    'SGD_KWARGS', 'ADAM_KWARGS', 'ADAMW_KWARGS', 'RMSPROP_KWARGS', 'ADADELTA_KWARGS',
+    'lr_scheduler', 'STEPLR_KWARGS', 'LAMBDALR_KWARGS', 'MULTISTEPLR_KWARGS', 'POLYLR_KWARGS',
+    'AUGMENTATION',
+}
+
+
+def apply_hpo_overrides(config, enabled=False):
+    """Apply explicit remote HPO values to a copy, never to the YAML file."""
+    from copy import deepcopy
+    if not enabled:
+        return config, {}
+    task_id = os.environ.get('CLEARML_TASK_ID')
+    if not task_id:
+        raise ValueError('--hpo requires a ClearML remote task')
+    from clearml import Task
+    # Nonzero torchrun ranks only read the task; they must not initialize a task.
+    task = Task.current_task() or Task.get_task(task_id=task_id)
+    parameters = task.get_parameters(cast=True)
+    result = deepcopy(config)
+    changed = {}
+    for path, value in parameters.items():
+        if not path.startswith('Training/'):
+            continue
+        keys = path[len('Training/'):].split('/')
+        if keys[0] not in HPO_CONFIG_KEYS:
+            continue
+        current = result
+        for index, name in enumerate(keys):
+            if not isinstance(current, dict):
+                raise ValueError(f'HPO parameter is not a config field: {path}')
+            matches = [key for key in current if str(key) == name]
+            if len(matches) != 1:
+                raise ValueError(f'Unknown or ambiguous HPO config field: {path}')
+            key = matches[0]
+            if index < len(keys) - 1:
+                current = current[key]
+                continue
+            previous = current[key]
+            # The SDK normally casts types; accept serialized numeric/list values too.
+            if isinstance(value, str) and not isinstance(previous, str):
+                import yaml
+                value = yaml.safe_load(value)
+                if isinstance(value, str) and type(previous) is float:
+                    value = float(value)
+            if value != previous:
+                changed[path] = {'before': deepcopy(previous), 'after': deepcopy(value)}
+            current[key] = deepcopy(value)
+    return result, changed
+
+
 def init_logger(conf):
     if conf.get('distributed', False) and conf['global_rank'] != 0:
         return None
@@ -26,7 +81,8 @@ def init_logger(conf):
         if isinstance(value, list):
             return [string_keys(item) for item in value]
         return value
-    task.connect(string_keys(conf), name='Training', ignore_remote_overrides=True)
+    from utils.run_output import resolved_config
+    task.connect(string_keys(resolved_config(conf)), name='Training', ignore_remote_overrides=True)
     return task.get_logger()
 
 

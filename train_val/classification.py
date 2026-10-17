@@ -20,6 +20,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.nn.parallel import DataParallel, DistributedDataParallel
 
+from dataset.augmentation import build_batch_mix
 from utils.train_utils import AverageMeter
 from utils.run_output import resolved_config
 
@@ -69,14 +70,8 @@ class Trainer:
         self.report_freq = conf['print_freq']
         self.train_step = conf['start_epoch'] * len(dataloader)
         self.epoch = conf['start_epoch']
-        self.batch_mix = None
-        if conf['dataset'] == 'image_net_1K' and not conf['dummy']:
-            from torchvision.transforms import v2
-            # Apply one of MixUp/CutMix to 10% of training batches.
-            self.batch_mix = v2.RandomChoice([
-                v2.MixUp(alpha=0.8, num_classes=1000),
-                v2.CutMix(alpha=1.0, num_classes=1000),
-            ])
+        self.batch_mix = build_batch_mix(conf)
+        self.batch_mix_p = conf['AUGMENTATION']['batch']['p']
 
     def __call__(self, model, epoch):
         self.epoch = epoch
@@ -92,7 +87,7 @@ class Trainer:
             images = images.to(self.device, non_blocking=True)
             target = target.to(self.device, non_blocking=True)
             loss_target = target
-            mixed = self.batch_mix is not None and torch.rand(()).item() < 0.1
+            mixed = self.batch_mix is not None and torch.rand(()).item() < self.batch_mix_p
             if mixed:
                 images, loss_target = self.batch_mix(images, target)
             self.optimizer.zero_grad(set_to_none=True)

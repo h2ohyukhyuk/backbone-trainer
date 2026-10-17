@@ -199,7 +199,7 @@ class RuntimeTests(unittest.TestCase):
         stamp = datetime.now(ZoneInfo('Asia/Seoul')).strftime('%y%m%d')
         paths = [reserve_run_directory(base) for _ in range(3)]
         self.assertEqual([p.name for p in paths], ['run', f'run-{stamp}', f'run-{stamp}-2'])
-        args = main.parse_args(['--config_path', 'experiments/APAGNet.yml'])
+        args = main.parse_args(['--config_path', 'experiments/config.yml'])
         args.num_nodes = 1
         args.node_rank = 0
         args.global_rank = 0
@@ -208,7 +208,7 @@ class RuntimeTests(unittest.TestCase):
         args.total_processes = 2
         args.output_dir = str(paths[0])
         save_run_config(args, paths[0])
-        self.assertEqual((paths[0] / 'APAGNet.yml').read_bytes(), Path(args.config_path).read_bytes())
+        self.assertEqual((paths[0] / 'config.yml').read_bytes(), Path(args.config_path).read_bytes())
         resolved = main.read_config(paths[0] / 'config.resolved.yml')
         main.validate_config(resolved)
         self.assertEqual(resolved['num_nodes'], 1)

@@ -2,9 +2,9 @@
 
 Examples (from the project directory):
     python main.py
-    python main.py --config_path experiments/APAGNet.yml
+    python main.py --config_path experiments/config.yml
     python main.py --config_path experiments/APAGNet_cifar10.yml
-    torchrun --standalone --nproc_per_node=2 main.py --config_path experiments/APAGNet.yml
+    torchrun --standalone --nproc_per_node=2 main.py --config_path experiments/config.yml
 
 Training settings live in YAML. Use --plot-lr to save an LR preview without training.
 An experiment file overrides experiments/config_default.yaml in this project.
@@ -49,7 +49,7 @@ def validate_config(config):
         float: ('LR', 'MOMENTUM', 'WEIGHT_DECAY'),
         bool: ('evaluate', 'pretrained', 'no_accel', 'multiprocessing_distributed', 'dummy', 'download', 'AMS_GRAD', 'USE_LR_MULT', 'amp'),
         dict: ('model_kwargs', 'SGD_KWARGS', 'ADAM_KWARGS', 'ADAMW_KWARGS', 'RMSPROP_KWARGS', 'ADADELTA_KWARGS',
-               'STEPLR_KWARGS', 'LAMBDALR_KWARGS', 'MULTISTEPLR_KWARGS', 'POLYLR_KWARGS'),
+               'STEPLR_KWARGS', 'LAMBDALR_KWARGS', 'MULTISTEPLR_KWARGS', 'POLYLR_KWARGS', 'AUGMENTATION'),
         list: ('LR_MULT_TARGET', 'LR_MULT_VAL'),
     }
     expected_keys = {name for names in types.values() for name in names}
@@ -70,6 +70,8 @@ def validate_config(config):
                     raise ValueError(f'{name} must be a number') from exc
             elif type(value) is not expected_type:
                 raise ValueError(f'{name} must be {expected_type.__name__}')
+    from dataset.augmentation import validate_augmentation
+    validate_augmentation(config['AUGMENTATION'])
     if not all(isinstance(key, str) for key in config['model_kwargs']):
         raise ValueError('model_kwargs must contain string keys')
     if config['dataset'] not in SUPPORTED_DATASETS:
@@ -90,7 +92,7 @@ def validate_config(config):
     }
     for section, schema in schemas.items():
         settings = config[section]
-        optional = {'interpolation', 'tangents'} if section == 'LAMBDALR_KWARGS' else set()
+        optional = {'interpolation', 'scale'} if section == 'LAMBDALR_KWARGS' else set()
         if section == 'LAMBDALR_KWARGS':
             if settings.keys() - (schema.keys() | optional):
                 raise ValueError('Unknown LAMBDALR_KWARGS interpolation keys')
@@ -162,7 +164,11 @@ def parse_args(argv=None):
                         help='plot all schedulers, or list steplr lambdalr multisteplr polylr; no training')
     parser.add_argument('--steps-per-epoch', type=int,
                         help='legacy LR preview option; accepted but no longer needed for epoch-based curves')
+    parser.add_argument('--hpo', action='store_true',
+                        help='remote HPO only: apply Training hyperparameters over YAML values')
     args = parser.parse_args(argv)
+    if args.hpo and args.plot_lr is not None:
+        parser.error('--hpo cannot be combined with --plot-lr')
     if args.steps_per_epoch is not None and (args.plot_lr is None or args.steps_per_epoch <= 0):
         parser.error('--steps-per-epoch requires --plot-lr and a positive integer')
     if args.plot_lr is not None:
@@ -182,10 +188,13 @@ def parse_args(argv=None):
                 raise ValueError(f'Unknown YAML keys: {sorted(unknown)}')
             config.update(overrides)
             validate_config(config)
+        from utils.clearml_utils import apply_hpo_overrides
+        config, hpo_overrides = apply_hpo_overrides(config, enabled=args.hpo)
+        validate_config(config)
     except (OSError, ValueError, yaml.YAMLError) as exc:
         parser.error(str(exc))
     return argparse.Namespace(config_path=str(args.config_path), plot_lr=args.plot_lr,
-                              steps_per_epoch=args.steps_per_epoch, **config)
+                              steps_per_epoch=args.steps_per_epoch, hpo=args.hpo, hpo_overrides=hpo_overrides, **config)
 
 
 def plot_learning_rate(args):
@@ -228,7 +237,8 @@ def plot_learning_rate(args):
             else:
                 y = [args.LR * settings['gamma'] ** sum(epoch >= m for m in settings['milestones'])
                      for epoch in x]
-        label = name + (f" ({args.LAMBDALR_KWARGS.get('interpolation', 'hermite')})" if name == 'lambdalr' else '')
+        label = name + (f" ({settings.get('interpolation', 'hermite')}, scale={settings.get('scale', 1.0):g})"
+                        if name == 'lambdalr' else '')
         ax.plot(x, y, label=label,
                 drawstyle='default' if smooth else 'steps-post')
     ax.set(xlabel='Epoch', ylabel='Learning rate', xlim=(0, args.epochs),
@@ -389,6 +399,8 @@ def main(args, device):
                  args.global_rank, args.total_processes)
     logging.info('Output directory: %s', save_dir)
     logging.info('Arguments: %s', vars(args))
+    if args.hpo:
+        logging.info('HPO config overrides: %s', args.hpo_overrides)
 
     from utils.clearml_utils import init_logger, init_best_model_registry
     logger = init_logger(vars(args))

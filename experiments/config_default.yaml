@@ -13,6 +13,40 @@ model_kwargs: {}              # num_classes is automatically selected for the da
 pretrained: false             # torchvision weights; custom models use resume
 dummy: false                 # Use FakeData with the selected dataset's sizes/classes
 
+# Training augmentation (validation transforms are deterministic and unchanged).
+# These defaults preserve the previous ImageNet/CIFAR-10 training behavior.
+AUGMENTATION:
+  image_net_1K:
+    crop_scale: [0.08, 1.0]        # RandomResizedCrop area fraction
+    crop_ratio: [0.75, 1.3333333333333333]
+    horizontal_flip_p: 0.5        # 0 disables flipping
+    randaugment_enabled: true
+    randaugment_num_ops: 2
+    randaugment_magnitude: 9      # Integer in [0, num_magnitude_bins-1]
+    randaugment_num_magnitude_bins: 31
+    random_erasing_p: 0.1         # 0 disables RandomErasing
+    random_erasing_scale: [0.02, 0.33]
+    random_erasing_ratio: [0.3, 3.3]
+    random_erasing_value: 0       # Number or 'random'; applied after normalization
+  cifar10:
+    random_crop_enabled: true    # Native 32x32 crop before resize to input_size
+    crop_padding: 4
+    horizontal_flip_p: 0.5
+    randaugment_enabled: false
+    randaugment_num_ops: 2
+    randaugment_magnitude: 9
+    randaugment_num_magnitude_bins: 31
+    random_erasing_p: 0.0
+    random_erasing_scale: [0.02, 0.33]
+    random_erasing_ratio: [0.3, 3.3]
+    random_erasing_value: 0
+  batch:
+    datasets: [image_net_1K]      # Add cifar10 to enable there; [] disables both
+    p: 0.1                      # Probability to apply ONE of MixUp/CutMix; 0 disables
+    mixup_alpha: 0.8
+    cutmix_alpha: 1.0
+    mixup_weight: 0.5            # Conditional MixUp probability; CutMix gets 1-weight
+
 # Data loading and training
 workers: 4                   # Worker count per node
 epochs: 90
@@ -75,20 +109,17 @@ STEPLR_KWARGS:
 
 # --- LambdaLR: epoch/LR keyframe interpolation (per optimizer update) ---
 LAMBDALR_KWARGS:
+  scale: 0.95               # Multiply every point LR and the whole interpolated curve
   points:                  # Completed epoch: absolute LR (fractional epochs supported)
     0: 0.0001
     2: 0.01
-    10: 0.009
-    20: 0.006
-    30: 0.005
-    40: 0.002
-    50: 0.0019
-    60: 0.001
-    70: 0.0009
-    80: 0.0002
-    90: 0.00005
-  interpolation: hermite   # hermite | catmullrom (aliases: hemit | catmulrome)
-  tangents: []              # Hermite slopes in ascending epoch order; [] means all zero
+    15: 0.007
+    20: 0.007
+    43: 0.002
+    48: 0.002
+    70: 0.0003
+    90: 0.00001
+  interpolation: hermite   # Hermite only
 
 # --- MultiStepLR: decay at specified epoch milestones ---
 MULTISTEPLR_KWARGS:
@@ -99,7 +130,7 @@ MULTISTEPLR_KWARGS:
 POLYLR_KWARGS:
   power: 0.85               # LR * (1 - completed_epochs / epochs) ** power; ends at zero
 
-seed: null                   # Integer for deterministic training, or null
+seed: 1024                   # Integer for deterministic training, or null
 print_freq: 200
 
 # Checkpoints and evaluation
