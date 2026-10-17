@@ -9,7 +9,6 @@ node_rank: 0
 
 dist_url: tcp://127.0.0.1:29500
 batch_size: 768              # Two GPUs: 384 per GPU
-workers: 12                 # Per node; 6 DataLoader workers per GPU with two GPUs
 
 # Auto-spawn DDP on all visible GPUs:
 # python main.py --config_path experiments/config.yml
