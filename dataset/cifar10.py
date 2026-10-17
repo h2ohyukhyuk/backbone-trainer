@@ -17,10 +17,10 @@ NUM_CLASSES = 10
 
 def get_train_loader(conf):
     dataset = _build_dataset(conf, train=True)
-    distributed, rank, world_size = distributed_context(conf)
+    distributed, global_rank, total_processes = distributed_context(conf)
     sampler = None
     if distributed:
-        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank,
+        sampler = DistributedSampler(dataset, num_replicas=total_processes, rank=global_rank,
                                      shuffle=True, seed=conf['seed'] if conf['seed'] is not None else 0)
     return DataLoader(dataset, shuffle=sampler is None, sampler=sampler,
                       **loader_options(conf, distributed))
@@ -28,9 +28,9 @@ def get_train_loader(conf):
 
 def get_valid_loader(conf):
     dataset = _build_dataset(conf, train=False)
-    distributed, rank, world_size = distributed_context(conf)
+    distributed, global_rank, total_processes = distributed_context(conf)
     if distributed:
-        dataset = Subset(dataset, range(rank, len(dataset), world_size))
+        dataset = Subset(dataset, range(global_rank, len(dataset), total_processes))
     return DataLoader(dataset, shuffle=False, **loader_options(conf, distributed))
 
 
@@ -50,8 +50,8 @@ def _build_dataset(conf, train):
     ])
     if conf['download'] and dist.is_available() and dist.is_initialized():
         dataset = None
-        for rank in range(dist.get_world_size()):
-            if rank == dist.get_rank():
+        for download_rank in range(dist.get_world_size()):
+            if download_rank == dist.get_rank():
                 dataset = datasets.CIFAR10(conf['data'], train=train, download=True, transform=transform)
             dist.barrier()
         return dataset

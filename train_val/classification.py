@@ -150,7 +150,7 @@ class Validationer:
         self.amp_enabled, self.amp_dtype = amp_settings(conf, self.device)
         self.report_freq = conf['print_freq']
         self.distributed = conf.get('distributed', False)
-        self.is_main = not self.distributed or conf['rank'] == 0
+        self.is_main = not self.distributed or conf['global_rank'] == 0
         dataset_tag = 'imgn' if conf['dataset'] == 'image_net_1K' else conf['dataset']
         suffix = f'-{dataset_tag}' + ('-dummy' if conf['dummy'] else '')
         self.local_path = Path(conf['output_dir']) if conf.get('output_dir') else Path(conf['save']) / (conf['arch'] + suffix)

@@ -32,7 +32,7 @@ class RuntimeTests(unittest.TestCase):
         self.conf = vars(main.parse_args([]))
         self.conf.update(no_accel=True, dataset='cifar10', dummy=True,
                          start_epoch=0, save=self.directory.name, arch='tiny',
-                         distributed=False, rank=0, print_freq=100)
+                         distributed=False, global_rank=0, print_freq=100)
         self.loader = DataLoader(TensorDataset(torch.randn(5, 3), torch.tensor([0, 1, 0, 1, 0])), batch_size=2)
         self.model = torch.nn.Linear(3, 2)
         self.opt = torch.optim.SGD(self.model.parameters(), lr=.01)
@@ -88,14 +88,14 @@ class RuntimeTests(unittest.TestCase):
             remote_bootstrap()
             self.assertIsNone(init_logger(self.conf))
         with patch.dict('os.environ', {'CLEARML_TASK_ID': 'submitted'}, clear=True):
-            self.conf.update(distributed=True, rank=1)
+            self.conf.update(distributed=True, global_rank=1)
             self.assertIsNone(init_logger(self.conf))
 
     def test_registry_only_remote_rank_zero(self):
         with patch.dict('os.environ', {}, clear=True), patch.dict('sys.modules', {'clearml': None}):
             self.assertIsNone(init_best_model_registry(self.conf))
         with patch.dict('os.environ', {'CLEARML_TASK_ID': 'submitted'}, clear=True):
-            self.assertIsNone(init_best_model_registry({**self.conf, 'distributed': True, 'rank': 1}))
+            self.assertIsNone(init_best_model_registry({**self.conf, 'distributed': True, 'global_rank': 1}))
 
     def test_best_model_reuses_one_registry_entry_and_uploads_synchronously(self):
         created, uploads = [], []
@@ -145,6 +145,46 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(latest['best_acc1'], 80.)
         self.assertEqual(registry.update.call_count, 2)
 
+    def test_spawn_node_and_global_ranks_remain_separate(self):
+        args = main.parse_args([])
+        args.num_nodes, args.node_rank = 2, 1
+        args.multiprocessing_distributed = True
+        main.configure_process_ranks(args, True, 2, environ={})
+        self.assertEqual(args.total_processes, 4)
+        self.assertEqual(args.processes_per_node, 2)
+        for local_rank in (0, 1):
+            worker = copy.deepcopy(args)
+            with patch('torch.cuda.is_available', return_value=True), patch('torch.cuda.set_device'), patch(
+                    'torch.distributed.init_process_group') as initialize, patch(
+                    'torch.distributed.is_initialized', return_value=False), patch.object(main, 'main'):
+                main.main_worker(local_rank, worker)
+            self.assertEqual(worker.node_rank, 1)
+            self.assertEqual(worker.local_rank, local_rank)
+            self.assertEqual(worker.global_rank, 2 + local_rank)
+            self.assertEqual(initialize.call_args.kwargs['rank'], 2 + local_rank)
+            self.assertEqual(initialize.call_args.kwargs['world_size'], 4)
+
+    def test_torchrun_ranks_are_derived_from_process_environment(self):
+        args = main.parse_args([])
+        args.multiprocessing_distributed = False
+        main.configure_process_ranks(args, True, 4, environ={
+            'WORLD_SIZE': '8', 'RANK': '6', 'LOCAL_RANK': '2', 'LOCAL_WORLD_SIZE': '4'})
+        self.assertEqual((args.num_nodes, args.node_rank), (2, 1))
+        self.assertEqual((args.local_rank, args.global_rank), (2, 6))
+        self.assertEqual((args.processes_per_node, args.total_processes), (4, 8))
+        self.assertFalse(hasattr(args, 'rank'))
+        self.assertFalse(hasattr(args, 'world_size'))
+
+    def test_loader_uses_global_identity_and_local_process_count(self):
+        from dataset.common import distributed_context, loader_options
+        conf = {**self.conf, 'distributed': True, 'node_rank': 1, 'global_rank': 3,
+                'total_processes': 4, 'processes_per_node': 2, 'batch_size': 256, 'workers': 4}
+        with patch('torch.distributed.is_initialized', return_value=False):
+            self.assertEqual(distributed_context(conf), (True, 3, 4))
+        options = loader_options(conf, True)
+        self.assertEqual(options['batch_size'], 128)
+        self.assertEqual(options['num_workers'], 2)
+
     def test_only_global_rank_zero_prints(self):
         with patch('torch.distributed.is_initialized', return_value=True), patch('builtins.print') as output:
             with patch('torch.distributed.get_rank', return_value=1):
@@ -160,15 +200,18 @@ class RuntimeTests(unittest.TestCase):
         paths = [reserve_run_directory(base) for _ in range(3)]
         self.assertEqual([p.name for p in paths], ['run', f'run-{stamp}', f'run-{stamp}-2'])
         args = main.parse_args(['--config_path', 'experiments/APAGNet.yml'])
-        args.world_size = 2
-        args.rank = 0
-        args.local_world_size = 2
+        args.num_nodes = 1
+        args.node_rank = 0
+        args.global_rank = 0
+        args.local_rank = 0
+        args.processes_per_node = 2
+        args.total_processes = 2
         args.output_dir = str(paths[0])
         save_run_config(args, paths[0])
         self.assertEqual((paths[0] / 'APAGNet.yml').read_bytes(), Path(args.config_path).read_bytes())
         resolved = main.read_config(paths[0] / 'config.resolved.yml')
         main.validate_config(resolved)
-        self.assertEqual(resolved['world_size'], 1)
+        self.assertEqual(resolved['num_nodes'], 1)
         self.assertNotIn('output_dir', resolved)
         conf = {**self.conf, 'output_dir': str(paths[0])}
         validator = runtime.Validationer(conf)

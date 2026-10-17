@@ -125,7 +125,7 @@ ImageNet 데이터는 직접 준비하며 `download`는 CIFAR-10에만 적용합
 | 환경 | 실행 방법 | 핵심 설정 |
 |---|---|---|
 | CPU / 단일 GPU | `python main.py` | `multiprocessing_distributed: false` |
-| 단일 노드 · 멀티 GPU DDP | `python main.py` 자동 spawn | `multiprocessing_distributed: true`, `world_size: 1`, `rank: 0` |
+| 단일 노드 · 멀티 GPU DDP | `python main.py` 자동 spawn | `multiprocessing_distributed: true`, `num_nodes: 1`, `node_rank: 0` |
 | 멀티 노드 DDP | 노드마다 `python main.py` | 공통 master 주소, 노드 수, 서로 다른 node rank |
 | torchrun | 노드마다 `torchrun ... main.py` | `multiprocessing_distributed: false`; 실행기가 rank 설정 |
 
@@ -139,8 +139,8 @@ CPU는 `no_accel: true`, CPU DDP는 `dist_backend: gloo`를 사용합니다.
 
 ```yaml
 multiprocessing_distributed: true
-world_size: 1
-rank: 0
+num_nodes: 1
+node_rank: 0
 gpu: null
 dist_backend: nccl
 dist_url: tcp://127.0.0.1:29500
@@ -169,8 +169,8 @@ arch: APAGNet
 data: /home/j/database/ImageNet1K
 save: /home/j/models_cla/
 multiprocessing_distributed: true
-world_size: 2
-rank: 0
+num_nodes: 2
+node_rank: 0
 gpu: null
 dist_backend: nccl
 dist_url: tcp://192.168.0.10:29500
@@ -180,7 +180,7 @@ amp: true
 
 **Node 1 — `experiments/APAGNet_node1.yml`**
 
-같은 내용을 복사하고 `rank`만 `1`로 바꿉니다.
+같은 내용을 복사하고 `node_rank`만 `1`로 바꿉니다.
 데이터 저장 위치가 다르면 각 노드의 `data`도 맞추되 데이터 내용과 클래스는 동일해야 합니다.
 
 ```bash
@@ -196,9 +196,25 @@ master 주소에 `127.0.0.1`을 쓰면 다른 컴퓨터가 연결할 수 없습�
 노드 간 master 포트 및 NCCL 통신이 가능해야 하며 컨테이너도 서로 접근할 수 있는 네트워크가 필요합니다.
 모델 체크포인트와 집계 지표는 global rank 0에서 저장·기록합니다.
 
+### rank와 프로세스 수: 명칭 구분
+
+| 이름 | 의미 | 설정 위치 |
+|---|---|---|
+| `num_nodes` | 전체 서버 수 | YAML (torchrun은 자동 계산) |
+| `node_rank` | 서버 번호 | YAML (torchrun은 자동 계산) |
+| `processes_per_node` | 서버당 GPU 프로세스 수 | visible GPU 수 또는 torchrun |
+| `local_rank` | 서버 안의 프로세스 번호 | 런타임 자동 배정 |
+| `total_processes` | 전체 프로세스 수 | `num_nodes × processes_per_node` |
+| `global_rank` | 전체 프로세스 번호 | `node_rank × processes_per_node + local_rank` |
+
+YAML의 기존 `world_size`/`rank` 키는 `num_nodes`/`node_rank`로 변경했습니다.
+코드에서 `node_rank`를 `global_rank`로 덮어쓰지 않습니다.
+출력·로그·파일 저장·ClearML 기록 기준은 언제나 `global_rank == 0`입니다.
+PyTorch API 인자 `world_size`, `rank`에는 각각 `total_processes`, `global_rank`를 전달합니다.
+
 ### 배치 크기와 rank의 의미
 
-spawn 방식에서 YAML의 `world_size`는 **노드 수**, `rank`는 **노드 번호**입니다.
+spawn 방식에서 YAML의 `num_nodes`는 **노드 수**, `node_rank`는 **노드 번호**입니다.
 내부에서 이를 전체 GPU 프로세스 수와 global rank로 변환합니다.
 
 | 구성 | `batch_size` | GPU당 배치 | 전체 배치 |
@@ -242,7 +258,7 @@ torchrun --nnodes=2 --nproc_per_node=2 --node_rank=1 \
 ```
 
 이 방식은 `torchrun`이 `WORLD_SIZE`, `RANK`, `LOCAL_RANK`를 설정합니다.
-코드는 YAML의 world/rank보다 실행기가 제공하는 값을 우선합니다.
+코드는 YAML의 num_nodes/node_rank보다 실행기가 제공하는 값을 우선합니다.
 
 ## ClearML 원격 실행
 

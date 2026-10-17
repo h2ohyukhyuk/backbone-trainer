@@ -10,7 +10,7 @@ def remote_bootstrap():
 
 
 def init_logger(conf):
-    if conf.get('distributed', False) and conf['rank'] != 0:
+    if conf.get('distributed', False) and conf['global_rank'] != 0:
         return None
     if not os.environ.get('CLEARML_TASK_ID'):
         return None
@@ -65,7 +65,7 @@ class BestModelRegistry:
 
 def init_best_model_registry(conf):
     if (not os.environ.get('CLEARML_TASK_ID')
-            or (conf.get('distributed', False) and conf['rank'] != 0)):
+            or (conf.get('distributed', False) and conf['global_rank'] != 0)):
         return None
     from clearml import Task
     task = Task.current_task()

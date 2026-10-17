@@ -4,8 +4,8 @@ arch: APAGNet                  # net/APAGNet.py:Network(); the alias apag also w
 seed: 1024
 # Start one process per visible GPU when invoked as python main.py by ClearML.
 multiprocessing_distributed: true
-world_size: 1
-rank: 0
+num_nodes: 1
+node_rank: 0
 gpu: null
 dist_url: tcp://127.0.0.1:29500
 batch_size: 256              # Two GPUs: 128 per GPU; benchmark 384/512 next

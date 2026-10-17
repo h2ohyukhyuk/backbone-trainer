@@ -45,7 +45,7 @@ def validate_config(config):
     types = {
         str: ('dataset', 'data', 'arch', 'save', 'resume', 'dist_url', 'dist_backend', 'lr_scheduler', 'OPT_NAME', 'amp_dtype'),
         int: ('workers', 'epochs', 'start_epoch', 'batch_size', 'print_freq',
-              'world_size', 'rank', 'seed', 'gpu', 'input_size'),
+              'num_nodes', 'node_rank', 'seed', 'gpu', 'input_size'),
         float: ('LR', 'MOMENTUM', 'WEIGHT_DECAY'),
         bool: ('evaluate', 'pretrained', 'no_accel', 'multiprocessing_distributed', 'dummy', 'download', 'AMS_GRAD', 'USE_LR_MULT', 'amp'),
         dict: ('model_kwargs', 'SGD_KWARGS', 'ADAM_KWARGS', 'ADAMW_KWARGS', 'RMSPROP_KWARGS', 'ADADELTA_KWARGS',
@@ -146,6 +146,8 @@ def validate_config(config):
             raise ValueError(f'{name.upper()}_KWARGS supports only {sorted(keys)}')
     if not config['data']:
         raise ValueError('data requires a path')
+    if config['num_nodes'] <= 0 or not 0 <= config['node_rank'] < config['num_nodes']:
+        raise ValueError('num_nodes must be positive; node_rank must be in [0, num_nodes)')
     if config['start_epoch'] > config['epochs']:
         raise ValueError('start_epoch cannot exceed epochs')
 
@@ -291,51 +293,62 @@ def main_ddp():
         return
     use_cuda = torch.cuda.is_available() and not args.no_accel
     gpus_per_node = torch.cuda.device_count() if use_cuda else 0
-    launched = 'LOCAL_RANK' in os.environ
-    if launched and args.multiprocessing_distributed:
-        raise ValueError('Set multiprocessing_distributed: false when using torchrun')
-
-    if launched:
-        args.world_size = int(os.environ['WORLD_SIZE'])
-        args.rank = int(os.environ['RANK'])
-        args.gpu = int(os.environ['LOCAL_RANK']) if use_cuda else None
-        args.dist_url = 'env://'
-    elif args.dist_url == 'env://':
-        if args.world_size == -1:
-            args.world_size = int(os.environ.get('WORLD_SIZE', '1'))
-        if args.rank == -1:
-            args.rank = int(os.environ.get('RANK', '0'))
-
-    args.distributed = launched or args.world_size > 1 or args.multiprocessing_distributed
+    configure_process_ranks(args, use_cuda, gpus_per_node)
     if args.distributed and not use_cuda and args.dist_backend == 'nccl':
         raise ValueError('CPU distributed training requires dist_backend: gloo')
-
     if args.multiprocessing_distributed:
-        if not use_cuda:
+        mp.spawn(main_worker, nprocs=args.processes_per_node, args=(args,))
+    else:
+        main_worker(args.local_rank, args)
+
+
+def configure_process_ranks(args, use_cuda, visible_gpu_count, environ=None):
+    """Keep node, local process and global process identities separate."""
+    env = os.environ if environ is None else environ
+    launched = 'LOCAL_RANK' in env
+    if launched and args.multiprocessing_distributed:
+        raise ValueError('Set multiprocessing_distributed: false when using torchrun')
+    if launched:
+        args.total_processes = int(env['WORLD_SIZE'])
+        args.global_rank = int(env['RANK'])
+        args.local_rank = int(env['LOCAL_RANK'])
+        args.processes_per_node = int(env['LOCAL_WORLD_SIZE'])
+        if (args.processes_per_node <= 0 or args.total_processes <= 0
+                or args.total_processes % args.processes_per_node
+                or not 0 <= args.global_rank < args.total_processes
+                or not 0 <= args.local_rank < args.processes_per_node):
+            raise ValueError('Invalid torchrun process ranks/counts')
+        args.num_nodes = args.total_processes // args.processes_per_node
+        args.node_rank = args.global_rank // args.processes_per_node
+        args.gpu = args.local_rank if use_cuda else None
+        args.dist_url = 'env://'
+    elif args.multiprocessing_distributed:
+        if not use_cuda or visible_gpu_count < 1:
             raise ValueError('multiprocessing_distributed requires CUDA; use torchrun for CPU DDP')
         if args.gpu is not None:
             raise ValueError('Set gpu: null with multiprocessing_distributed: true')
-        # This launch mode follows the example: world_size/rank refer to nodes.
-        args.world_size = max(args.world_size, 1) * gpus_per_node
-        args.rank = max(args.rank, 0)
-        args.local_world_size = gpus_per_node
-        mp.spawn(main_worker, nprocs=gpus_per_node, args=(args,))
+        args.processes_per_node = visible_gpu_count
+        args.total_processes = args.num_nodes * args.processes_per_node
+        # Local/global identities are assigned separately in each spawned worker.
+        args.local_rank = None
+        args.global_rank = None
     else:
-        local_processes = gpus_per_node if args.distributed and use_cuda else 1
-        args.local_world_size = int(os.environ.get('LOCAL_WORLD_SIZE', str(local_processes)))
-        if args.distributed and args.rank < 0:
-            raise ValueError('Distributed training requires rank in YAML or RANK from torchrun')
-        if args.distributed and use_cuda and args.gpu is None:
-            raise ValueError('Distributed training requires gpu in YAML or LOCAL_RANK from torchrun')
-        main_worker(args.gpu, args)
+        args.processes_per_node = 1
+        args.total_processes = args.num_nodes
+        args.local_rank = 0
+        args.global_rank = args.node_rank
+        if args.num_nodes > 1 and use_cuda and args.gpu is None:
+            args.gpu = 0
+    args.distributed = launched or args.total_processes > 1 or args.multiprocessing_distributed
 
 
-def main_worker(gpu, args):
-    args.gpu = gpu
+def main_worker(local_rank, args):
+    args.local_rank = local_rank
     if args.multiprocessing_distributed:
-        args.rank = args.rank * args.local_world_size + gpu
+        args.gpu = local_rank
+        args.global_rank = args.node_rank * args.processes_per_node + local_rank
     use_cuda = torch.cuda.is_available() and not args.no_accel
-    device = torch.device('cuda', gpu if gpu is not None else 0) if use_cuda else torch.device('cpu')
+    device = torch.device('cuda', args.gpu if args.gpu is not None else 0) if use_cuda else torch.device('cpu')
     if use_cuda:
         torch.cuda.set_device(device)
     if args.seed is not None:
@@ -345,7 +358,7 @@ def main_worker(gpu, args):
         cudnn.benchmark = False
     if args.distributed:
         dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
-                                world_size=args.world_size, rank=args.rank)
+                                world_size=args.total_processes, rank=args.global_rank)
     try:
         main(args, device)
     finally:
@@ -354,7 +367,7 @@ def main_worker(gpu, args):
 
 
 def main(args, device):
-    is_main = not args.distributed or args.rank == 0
+    is_main = not args.distributed or args.global_rank == 0
     dataset_tag = 'imgn' if args.dataset == 'image_net_1K' else args.dataset
     suffix = f'-{dataset_tag}' + ('-dummy' if args.dummy else '')
     from utils.run_output import reserve_run_directory, save_run_config
@@ -371,6 +384,9 @@ def main(args, device):
         handlers.append(logging.FileHandler(save_dir / f'log-{args.arch}{suffix}.txt', mode='a'))
     logging.basicConfig(level=logging.INFO if is_main else logging.WARNING,
                         format='%(message)s', handlers=handlers, force=True)
+    logging.info('Ranks: node_rank=%d/%d local_rank=%d/%d global_rank=%d/%d',
+                 args.node_rank, args.num_nodes, args.local_rank, args.processes_per_node,
+                 args.global_rank, args.total_processes)
     logging.info('Output directory: %s', save_dir)
     logging.info('Arguments: %s', vars(args))
 

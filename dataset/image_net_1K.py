@@ -2,7 +2,7 @@
 
 Both public functions take a configuration dictionary and return a DataLoader.
 The dataset root must contain train/<class>/* and val/<class>/*.
-main.py supplies distributed, rank, world_size and local_world_size at runtime.
+main.py supplies distributed, global_rank, total_processes and processes_per_node at runtime.
 batch_size and workers are per-node settings and are split among local DDP
 processes without changing the configuration dictionary.
 """
@@ -32,10 +32,10 @@ def get_train_loader(conf):
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
             transforms.RandomErasing(p=0.1),
         ]))
-    distributed, rank, world_size = distributed_context(conf)
+    distributed, global_rank, total_processes = distributed_context(conf)
     sampler = None
     if distributed:
-        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank,
+        sampler = DistributedSampler(dataset, num_replicas=total_processes, rank=global_rank,
                                      shuffle=True, seed=conf['seed'] if conf['seed'] is not None else 0)
     return DataLoader(dataset, shuffle=sampler is None, sampler=sampler,
                       **loader_options(conf, distributed))
@@ -55,7 +55,7 @@ def get_valid_loader(conf):
             transforms.ToTensor(),
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
         ]))
-    distributed, rank, world_size = distributed_context(conf)
+    distributed, global_rank, total_processes = distributed_context(conf)
     if distributed:
-        dataset = Subset(dataset, range(rank, len(dataset), world_size))
+        dataset = Subset(dataset, range(global_rank, len(dataset), total_processes))
     return DataLoader(dataset, shuffle=False, **loader_options(conf, distributed))

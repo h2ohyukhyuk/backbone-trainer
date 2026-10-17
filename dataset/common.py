@@ -10,21 +10,21 @@ def distributed_context(conf):
     if dist.is_available() and dist.is_initialized():
         return True, dist.get_rank(), dist.get_world_size()
     if conf.get('distributed', False):
-        rank, world_size = conf['rank'], conf['world_size']
-        if world_size <= 0 or not 0 <= rank < world_size:
-            raise ValueError('Distributed loaders require world_size > 0 and 0 <= rank < world_size')
-        return True, rank, world_size
+        global_rank, total_processes = conf['global_rank'], conf['total_processes']
+        if total_processes <= 0 or not 0 <= global_rank < total_processes:
+            raise ValueError('Distributed loaders require total_processes > 0 and 0 <= global_rank < total_processes')
+        return True, global_rank, total_processes
     return False, 0, 1
 
 
 def loader_options(conf, distributed):
     batch_size, workers = conf['batch_size'], conf['workers']
     if distributed:
-        local_world_size = conf.get('local_world_size', 1)
-        if local_world_size <= 0 or batch_size % local_world_size:
+        processes_per_node = conf.get('processes_per_node', 1)
+        if processes_per_node <= 0 or batch_size % processes_per_node:
             raise ValueError('batch_size must be divisible by the number of local processes')
-        batch_size //= local_world_size
-        workers = (workers + local_world_size - 1) // local_world_size
+        batch_size //= processes_per_node
+        workers = (workers + processes_per_node - 1) // processes_per_node
     return dict(batch_size=batch_size, num_workers=workers,
                 pin_memory=not conf['no_accel'] and torch.cuda.is_available(),
                 worker_init_fn=seed_worker if conf['seed'] is not None else None)

@@ -110,13 +110,13 @@ evaluate: false              # Run validation only
 # Devices and distributed training
 gpu: null                    # Fixed GPU ID, or null for automatic selection
 no_accel: false              # true forces CPU
-world_size: -1               # Node count for spawn; process count otherwise
-rank: -1                     # Node rank for spawn; process rank otherwise
+num_nodes: 1                # Number of servers (never the GPU/process count)
+node_rank: 0                # This server index: 0 .. num_nodes-1
 dist_url: tcp://224.66.41.62:23456
 dist_backend: nccl           # Use gloo for CPU DDP
 multiprocessing_distributed: false
 
-# torchrun automatically supplies world_size, rank, gpu and dist_url.
+# torchrun supplies global/local ranks and process counts through environment variables.
 # For the original spawn launch, set multiprocessing_distributed: true,
-# world_size: 1, rank: 0, gpu: null, dist_url: tcp://127.0.0.1:29500,
+# num_nodes: 1, node_rank: 0, gpu: null, dist_url: tcp://127.0.0.1:29500,
 # then run python main.py (or select an experiment with --config_path).
