@@ -6,7 +6,7 @@ Examples (from the project directory):
     python main.py --config_path experiments/APAGNet_cifar10.yml
     torchrun --standalone --nproc_per_node=2 main.py --config_path experiments/APAGNet.yml
 
-All training settings live in YAML; only the config file is selected on the CLI.
+Training settings live in YAML. Use --plot-lr to save an LR preview without training.
 An experiment file overrides experiments/config_default.yaml in this project.
 Relative data/save/resume paths are relative to the current working directory.
 """
@@ -25,9 +25,9 @@ import torch.backends.cudnn as cudnn
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DataParallel, DistributedDataParallel
-from torch.optim.lr_scheduler import StepLR
 import yaml
 
+from utils.train_utils import get_optimizer, get_scheduler, optimizer_kwargs
 from dataset import SUPPORTED_DATASETS, get_dataset_module
 from train_val.classification import Trainer, Validationer, unwrap_model
 
@@ -43,12 +43,14 @@ def read_config(path):
 def validate_config(config):
     """Validate settings without defining any default values in Python."""
     types = {
-        str: ('dataset', 'data', 'arch', 'save', 'resume', 'dist_url', 'dist_backend'),
+        str: ('dataset', 'data', 'arch', 'save', 'resume', 'dist_url', 'dist_backend', 'lr_scheduler', 'OPT_NAME'),
         int: ('workers', 'epochs', 'start_epoch', 'batch_size', 'print_freq',
-              'world_size', 'rank', 'seed', 'gpu', 'lr_step_size', 'input_size'),
-        float: ('lr', 'momentum', 'weight_decay', 'lr_gamma'),
-        bool: ('evaluate', 'pretrained', 'no_accel', 'multiprocessing_distributed', 'dummy', 'download'),
-        dict: ('model_kwargs',),
+              'world_size', 'rank', 'seed', 'gpu', 'input_size'),
+        float: ('LR', 'MOMENTUM', 'WEIGHT_DECAY'),
+        bool: ('evaluate', 'pretrained', 'no_accel', 'multiprocessing_distributed', 'dummy', 'download', 'AMS_GRAD', 'USE_LR_MULT'),
+        dict: ('model_kwargs', 'SGD_KWARGS', 'ADAM_KWARGS', 'ADAMW_KWARGS', 'RMSPROP_KWARGS', 'ADADELTA_KWARGS',
+               'STEPLR_KWARGS', 'LAMBDALR_KWARGS', 'MULTISTEPLR_KWARGS', 'POLYLR_KWARGS'),
+        list: ('LR_MULT_TARGET', 'LR_MULT_VAL'),
     }
     expected_keys = {name for names in types.values() for name in names}
     missing, unknown = expected_keys - config.keys(), config.keys() - expected_keys
@@ -72,12 +74,74 @@ def validate_config(config):
         raise ValueError('model_kwargs must contain string keys')
     if config['dataset'] not in SUPPORTED_DATASETS:
         raise ValueError(f'dataset must be one of {SUPPORTED_DATASETS}')
-    for name in ('batch_size', 'print_freq', 'lr_step_size', 'input_size'):
+    for name in ('batch_size', 'print_freq', 'input_size'):
         if config[name] <= 0:
             raise ValueError(f'{name} must be positive')
     for name in ('workers', 'epochs', 'start_epoch', 'gpu'):
         if config[name] is not None and config[name] < 0:
             raise ValueError(f'{name} cannot be negative')
+    if config['lr_scheduler'] not in ('steplr', 'lambdalr', 'multisteplr', 'polylr'):
+        raise ValueError('lr_scheduler must be steplr, lambdalr, multisteplr or polylr')
+    schemas = {
+        'STEPLR_KWARGS': {'step_size': int, 'gamma': float},
+        'LAMBDALR_KWARGS': {'points': dict},
+        'MULTISTEPLR_KWARGS': {'milestones': list, 'gamma': float},
+        'POLYLR_KWARGS': {'power': float},
+    }
+    for section, schema in schemas.items():
+        settings = config[section]
+        optional = {'interpolation', 'tangents'} if section == 'LAMBDALR_KWARGS' else set()
+        if section == 'LAMBDALR_KWARGS':
+            if settings.keys() - (schema.keys() | optional):
+                raise ValueError('Unknown LAMBDALR_KWARGS interpolation keys')
+            from utils.lr_interpolation import epoch_lr_curve
+            epoch_lr_curve(settings)
+            continue
+        if not schema.keys() <= settings.keys() or settings.keys() - (schema.keys() | optional):
+            raise ValueError(f'{section} requires {sorted(schema)}')
+        for key, expected in schema.items():
+            value = settings[key]
+            if expected is float:
+                if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+                    raise ValueError(f'{section}.{key} must be a number')
+                try:
+                    settings[key] = float(value)
+                except ValueError as exc:
+                    raise ValueError(f'{section}.{key} must be a number') from exc
+            elif type(value) is not expected:
+                raise ValueError(f'{section}.{key} must be {expected.__name__}')
+    step = config['STEPLR_KWARGS']
+    multi, poly = config['MULTISTEPLR_KWARGS'], config['POLYLR_KWARGS']
+    if step['step_size'] <= 0 or not 0 < step['gamma'] <= 1:
+        raise ValueError('STEPLR_KWARGS requires step_size > 0 and gamma in (0, 1]')
+    milestones = multi['milestones']
+    if (any(type(epoch) is not int or epoch <= 0 for epoch in milestones)
+            or milestones != sorted(set(milestones))):
+        raise ValueError('MULTISTEPLR_KWARGS.milestones must be strictly increasing positive integers')
+    if not 0 < multi['gamma'] <= 1:
+        raise ValueError('MULTISTEPLR_KWARGS.gamma must be in (0, 1]')
+    if not 0 < poly['power'] < float('inf'):
+        raise ValueError('POLYLR_KWARGS.power must be finite and positive')
+    if config['OPT_NAME'] not in ('sgd', 'adam', 'adamw', 'rmsprop', 'adadelta'):
+        raise ValueError('OPT_NAME must be sgd, adam, adamw, rmsprop or adadelta')
+    if not 0 < config['LR'] < float('inf'):
+        raise ValueError('LR must be finite and positive')
+    if not 0 <= config['MOMENTUM'] < float('inf') or not 0 <= config['WEIGHT_DECAY'] < float('inf'):
+        raise ValueError('MOMENTUM and WEIGHT_DECAY must be finite and nonnegative')
+    targets, values = config['LR_MULT_TARGET'], config['LR_MULT_VAL']
+    if len(targets) != len(values) or not all(isinstance(k, str) and k for k in targets):
+        raise ValueError('LR_MULT_TARGET and LR_MULT_VAL require matching keyword/value lists')
+    if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not 0 < v < float('inf') for v in values):
+        raise ValueError('LR_MULT_VAL must contain finite positive numbers')
+    allowed = {
+        'sgd': {'dampening', 'nesterov'},
+        'adam': {'betas', 'eps'}, 'adamw': {'betas', 'eps'},
+        'rmsprop': {'alpha', 'eps', 'centered'}, 'adadelta': {'rho', 'eps'},
+    }
+    for name, keys in allowed.items():
+        options = config[name.upper() + '_KWARGS']
+        if options.keys() - keys:
+            raise ValueError(f'{name.upper()}_KWARGS supports only {sorted(keys)}')
     if not config['data']:
         raise ValueError('data requires a path')
     if config['start_epoch'] > config['epochs']:
@@ -90,7 +154,20 @@ def parse_args(argv=None):
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--config_path', '--config-path', type=Path, default=default_path,
                         help='experiment YAML to overlay on config_default.yaml')
+    parser.add_argument('--plot-lr', '--plot_lr', nargs='*', default=None, metavar='SCHEDULER',
+                        help='plot all schedulers, or list steplr lambdalr multisteplr polylr; no training')
+    parser.add_argument('--steps-per-epoch', type=int,
+                        help='legacy LR preview option; accepted but no longer needed for epoch-based curves')
     args = parser.parse_args(argv)
+    if args.steps_per_epoch is not None and (args.plot_lr is None or args.steps_per_epoch <= 0):
+        parser.error('--steps-per-epoch requires --plot-lr and a positive integer')
+    if args.plot_lr is not None:
+        names = args.plot_lr or ['steplr', 'lambdalr', 'multisteplr', 'polylr']
+        names = ['lambdalr' if name == 'lamdalr' else name for name in names]
+        invalid = set(names) - {'steplr', 'lambdalr', 'multisteplr', 'polylr'}
+        if invalid:
+            parser.error(f'Unknown plot schedulers: {sorted(invalid)}')
+        args.plot_lr = list(dict.fromkeys(names))
     try:
         config = read_config(default_path)
         validate_config(config)
@@ -103,7 +180,67 @@ def parse_args(argv=None):
             validate_config(config)
     except (OSError, ValueError, yaml.YAMLError) as exc:
         parser.error(str(exc))
-    return argparse.Namespace(config_path=str(args.config_path), **config)
+    return argparse.Namespace(config_path=str(args.config_path), plot_lr=args.plot_lr,
+                              steps_per_epoch=args.steps_per_epoch, **config)
+
+
+def plot_learning_rate(args):
+    """Plot epoch-based schedule formulas without data access or optimizer steps."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import MaxNLocator, MultipleLocator
+
+    if args.epochs <= 0:
+        raise ValueError('LR plotting requires epochs > 0')
+    # Curves are defined in epoch coordinates; no dataset scan or optimizer simulation.
+    names = args.plot_lr
+    fig, ax = plt.subplots(figsize=(10, 5))
+    for name in names:
+        settings = vars(args)[name.upper() + '_KWARGS']
+        smooth = name in ('lambdalr', 'polylr')
+        if smooth:
+            # Bounded sampling plus all epoch/keyframe boundaries preserves short segments.
+            sample_count = min(4000, max(1000, args.epochs * 20))
+            positions = {args.epochs * i / sample_count for i in range(sample_count + 1)}
+            positions.update(range(args.epochs + 1))
+            if name == 'lambdalr':
+                from utils.lr_interpolation import epoch_lr_curve
+                curve = epoch_lr_curve(settings)
+                positions.update(epoch for epoch in settings['points'] if 0 <= epoch <= args.epochs)
+                # Resolve very short keyframe intervals as well.
+                knots = sorted({0, args.epochs} | {epoch for epoch in settings['points']
+                                                 if 0 <= epoch <= args.epochs})
+                for left, right in zip(knots, knots[1:]):
+                    positions.update(left + (right - left) * i / 32 for i in range(33))
+            else:
+                curve = lambda epoch: args.LR * max(0.0, 1 - epoch / args.epochs) ** settings['power']
+            x = sorted(positions)
+            y = [curve(epoch) for epoch in x]
+        else:
+            x = list(range(args.epochs + 1))
+            if name == 'steplr':
+                y = [args.LR * settings['gamma'] ** (epoch // settings['step_size']) for epoch in x]
+            else:
+                y = [args.LR * settings['gamma'] ** sum(epoch >= m for m in settings['milestones'])
+                     for epoch in x]
+        label = name + (f" ({args.LAMBDALR_KWARGS.get('interpolation', 'hermite')})" if name == 'lambdalr' else '')
+        ax.plot(x, y, label=label,
+                drawstyle='default' if smooth else 'steps-post')
+    ax.set(xlabel='Epoch', ylabel='Learning rate', xlim=(0, args.epochs),
+           title=f'{Path(args.config_path).stem} | LR schedulers')
+    ax.legend()
+    ax.ticklabel_format(axis='y', style='sci', scilimits=(-3, 3))
+    ax.xaxis.set_major_locator(MaxNLocator(nbins=10, integer=True))
+    ax.xaxis.set_minor_locator(MultipleLocator(1))
+    ax.grid(True, which='major', alpha=0.3)
+    ax.grid(True, which='minor', axis='x', alpha=0.15)
+    fig.tight_layout()
+    output = Path(__file__).resolve().parent / 'experiments' / (Path(args.config_path).stem + '_lr_curve.png')
+    fig.savefig(output, dpi=160)
+    plt.close(fig)
+    print(f'Saved LR plot: {output} (epoch-based curves; no dataset access)')
+    return output
 
 
 def local_models():
@@ -143,6 +280,10 @@ def create_model(args):
 
 def main_ddp():
     args = parse_args()
+    if args.plot_lr is not None:
+        if int(os.environ.get('RANK', '0')) == 0:
+            plot_learning_rate(args)
+        return
     use_cuda = torch.cuda.is_available() and not args.no_accel
     gpus_per_node = torch.cuda.device_count() if use_cuda else 0
     launched = 'LOCAL_RANK' in os.environ
@@ -217,7 +358,7 @@ def main(args, device):
         save_dir.mkdir(parents=True, exist_ok=True)
         handlers.append(logging.FileHandler(save_dir / f'log-{args.arch}{suffix}.txt', mode='a'))
         config = {key: value for key, value in vars(args).items()
-                  if key not in ('config_path', 'distributed', 'local_world_size')}
+                  if key not in ('config_path', 'distributed', 'local_world_size', 'plot_lr', 'steps_per_epoch')}
         if args.multiprocessing_distributed:
             config['world_size'] //= args.local_world_size
             config['rank'] //= args.local_world_size
@@ -233,14 +374,13 @@ def main(args, device):
     elif device.type == 'cuda' and args.gpu is None and torch.cuda.device_count() > 1:
         model = DataParallel(model)
 
-    optimizer = torch.optim.SGD(model.parameters(), args.lr, momentum=args.momentum,
-                                weight_decay=args.weight_decay)
-    scheduler = StepLR(optimizer, step_size=args.lr_step_size, gamma=args.lr_gamma)
-    best_acc1 = load_checkpoint(args, model, optimizer, scheduler)
+    optimizer = get_optimizer(unwrap_model(model), **optimizer_kwargs(vars(args)))
     conf = vars(args)
     dataset_module = get_dataset_module(args.dataset)
     train_loader = dataset_module.get_train_loader(conf)
     val_loader = dataset_module.get_valid_loader(conf)
+    scheduler = get_scheduler(optimizer, {**conf, 'total_steps': len(train_loader) * args.epochs})
+    best_acc1 = load_checkpoint(args, model, optimizer, scheduler)
     trainer = Trainer(conf, train_loader, optimizer, scheduler)
     validationer = Validationer(conf, optimizer=optimizer, scheduler=scheduler, best_acc=best_acc1)
     if args.evaluate:

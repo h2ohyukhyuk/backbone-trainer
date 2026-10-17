@@ -156,7 +156,7 @@ def get_optimizer(target_model, **kwargs):
     opt_name = kwargs.pop('OPT_NAME', None)
     base_lr = kwargs.pop('LR', None)
     momentum = kwargs.pop('MOMENTUM', 0.9)
-    use_lr_mult = kwargs.pop('USE_LR_MULT', None)
+    use_lr_mult = kwargs.pop('USE_LR_MULT', False)
     lr_mult_target = kwargs.pop('LR_MULT_TARGET', None)
     lr_mult_val = kwargs.pop('LR_MULT_VAL', None)
     amsgrad = kwargs.pop('AMS_GRAD', False)
@@ -176,7 +176,7 @@ def get_optimizer(target_model, **kwargs):
         opt = torch.optim.AdamW(params_dict, lr=base_lr, amsgrad=amsgrad,
                                       weight_decay=wd, **others)
     elif opt_name == "rmsprop":
-        opt = torch.optim.RMSprop(params_dict, lr=base_lr,
+        opt = torch.optim.RMSprop(params_dict, lr=base_lr, momentum=momentum,
                                   weight_decay=wd, **others)
     elif opt_name == "adadelta":
         opt = torch.optim.Adadelta(params_dict, lr=base_lr,
@@ -185,37 +185,54 @@ def get_optimizer(target_model, **kwargs):
         opt = torch.optim.SGD(params_dict, base_lr, momentum=momentum,
                               weight_decay=wd, **others)
     else:
-        print("ERROR: Unknown optimizer.")
-        print("Rquested optimizer is ", opt_name)
-        exit(1)
+        raise ValueError(f'Unknown optimizer: {opt_name!r}')
 
     return opt
 
-def get_scheduler(opt, conf):
+def optimizer_kwargs(conf):
+    """Pass only the selected optimizer's settings to get_optimizer."""
+    common = ('OPT_NAME', 'LR', 'MOMENTUM', 'WEIGHT_DECAY', 'AMS_GRAD',
+              'USE_LR_MULT', 'LR_MULT_TARGET', 'LR_MULT_VAL')
+    return {**{key: conf[key] for key in common},
+            **conf[conf['OPT_NAME'].upper() + '_KWARGS']}
 
-    sch_name = conf['OPTIMIZER']['LR_SCHEDULER']['SCHEDULER_NAME']
+
+def get_scheduler(opt, conf):
+    """Read scheduler settings directly from the training configuration.
+
+    LambdaLR steps per update; other schedulers step per epoch.
+    """
+    sch_name = conf['lr_scheduler']
+    settings = conf[sch_name.upper() + '_KWARGS']
 
     if sch_name == "steplr":
-        step_size = conf['OPTIMIZER']['LR_SCHEDULER']['step_size']
-        gamma = conf['OPTIMIZER']['LR_SCHEDULER']['gamma']
+        step_size = settings['step_size']
+        gamma = settings['gamma']
         sch = torch.optim.lr_scheduler.StepLR(opt, step_size, gamma)
+    elif sch_name == "lambdalr":
+        from utils.lr_interpolation import epoch_lr_curve
+        curve = epoch_lr_curve(settings)
+        total, epochs = conf['total_steps'], conf['epochs']
+        if epochs <= 0 or total <= 0 or total % epochs:
+            raise ValueError('interpolation requires positive epochs and whole steps per epoch')
+        steps_per_epoch = total // epochs
+        base_lr = conf['LR']
+        if base_lr <= 0:
+            raise ValueError('LR must be positive for interpolation')
+        sch = torch.optim.lr_scheduler.LambdaLR(
+            opt, lambda step: curve(step / steps_per_epoch) / base_lr)
+        sch.step_per_batch = True
     elif sch_name == "multisteplr":
-        milestones = conf['OPTIMIZER']['LR_SCHEDULER']['milestones']
-        gamma = conf['OPTIMIZER']['LR_SCHEDULER']['gamma']
+        milestones = settings['milestones']
+        gamma = settings['gamma']
         sch = torch.optim.lr_scheduler.MultiStepLR(opt, milestones, gamma)
-    # elif sch_name == "plateau":
-    #     sch = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, **others)
-    elif sch_name == 'poly':
+    elif sch_name == 'polylr':
         from utils.custom_lr_scheduler import PolynomialLRDecay
-        lr = conf['OPTIMIZER']['LR']
-        power = conf['OPTIMIZER']['LR_SCHEDULER']['POWER']
-        max_steps = int(conf['NUM_TRAIN_STEPS'] * conf['TRAIN']['END_EPOCH'])
+        power = settings['power']
+        max_steps = conf['epochs']
         sch = PolynomialLRDecay(opt, max_steps, power)
     else:
-        print("Unknown scheduler.")
-        print("Rquested scheduler is ", sch_name)
-        print("Return None")
-        return None
+        raise ValueError(f'Unknown scheduler: {sch_name!r}')
 
     return sch
 

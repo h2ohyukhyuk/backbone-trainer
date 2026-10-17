@@ -1,4 +1,4 @@
-# Classification
+# Introduction
 
 원하는 딥러닝 네트워크 구조를 직접 작성하고, 분류 태스크의 모델을 학습할 수 있는 PyTorch 기반 학습 프레임워크입니다.
 
@@ -34,7 +34,7 @@ download: true
 arch: APAGNet
 batch_size: 128
 epochs: 90
-lr: 0.1
+LR: 0.1
 save: ./checkpoints
 ```
 
@@ -102,7 +102,7 @@ model_kwargs:
   width: 64
 batch_size: 128
 epochs: 90
-lr: 0.1
+LR: 0.1
 save: ./checkpoints
 seed: 1024
 dist_url: env://
@@ -139,7 +139,7 @@ python main.py --config_path experiments/APAGNet.yml
 | `epochs` | 학습을 종료할 전체 epoch 수 |
 | `batch_size` | 노드당 배치 크기. DDP에서는 로컬 프로세스 수로 나눔 |
 | `workers` | DataLoader worker 수. DDP에서는 로컬 프로세스에 분배 |
-| `lr`, `momentum`, `weight_decay` | SGD 설정 |
+| `LR`, `momentum`, `weight_decay` | SGD 설정 |
 | `lr_step_size`, `lr_gamma` | StepLR의 갱신 주기와 학습률 배율 |
 | `seed` | 난수 시드. `null`이면 시드 고정을 적용하지 않음 |
 | `save` | 체크포인트 및 로그를 저장할 상위 디렉터리 |
@@ -201,6 +201,94 @@ torchrun --standalone --nproc_per_node=2 main.py \
 `batch_size`는 로컬 프로세스 수로 나누어떨어져야 합니다. 예를 들어 `batch_size: 128`로 두 GPU를 사용하면 각 프로세스의 배치 크기는 64입니다. 검증 샘플은 프로세스에 중복 없이 분배하고, 결과를 합산하여 전체 검증 정확도를 계산합니다.
 
 `python main.py`로 실행하면 GPU 한 개에서는 단일 GPU를 사용합니다. 여러 GPU가 보이고 `gpu: null`이면 DataParallel을 사용합니다. CPU로 실행하려면 `no_accel: true`를 설정합니다. CPU DDP에는 `dist_backend: gloo`를 사용합니다.
+
+## 옵티마이저 선택
+
+기존 `get_optimizer()`를 사용하며 YAML 변수 이름은 함수와 동일합니다.
+기존 소문자 `lr`, `momentum`, `weight_decay` 설정은 `LR`, `MOMENTUM`, `WEIGHT_DECAY`로 변경하세요.
+
+```yaml
+OPT_NAME: adamw
+LR: 0.001
+WEIGHT_DECAY: 0.01
+AMS_GRAD: false
+ADAMW_KWARGS:
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+```
+
+공통 설정은 `OPT_NAME`, `LR`, `WEIGHT_DECAY`입니다. `MOMENTUM`은 SGD/RMSprop,
+`AMS_GRAD`는 Adam/AdamW에서 사용합니다. 선택한 옵티마이저의 `*_KWARGS` 구역만 전달합니다.
+실험 파일의 `*_KWARGS`는 기본 구역 전체를 덮어쓰므로 변경 시 해당 구역 전체를 복사하세요.
+`USE_LR_MULT`, `LR_MULT_TARGET`, `LR_MULT_VAL`도 그대로 지원합니다.
+모듈별 multiplier는 LambdaLR에 지정한 기준 LR 곡선에 곱해집니다.
+LR 그래프는 공통 `LR`의 기준 곡선을 표시합니다.
+
+## 학습률 스케줄러
+
+`lr_scheduler`로 선택하고 해당 `*_KWARGS` 구역만 변경하세요.
+
+| 선택값 | 설정 구역 / 키 | 갱신 단위 |
+|---|---|---|
+| `steplr` | `STEPLR_KWARGS`: `step_size`, `gamma` | epoch |
+| `lambdalr` | `LAMBDALR_KWARGS`: `points`, `interpolation`, `tangents` | optimizer update |
+| `multisteplr` | `MULTISTEPLR_KWARGS`: `milestones`, `gamma` | 지정 epoch |
+| `polylr` | `POLYLR_KWARGS`: `power` | epoch |
+
+PolyLR은 warmup 없이 `LR × (1 - 완료 epoch / epochs)^power`로 0까지 감소합니다.
+실험 YAML의 `*_KWARGS`는 기본 구역 전체를 덮어쓰므로 해당 구역 전체를 작성하세요.
+재개 시 스케줄러 종류와 설정, 전체 epoch와 배치 설정을 유지하세요.
+
+### Epoch별 LR 지정과 보간
+
+```yaml
+lr_scheduler: lambdalr
+LAMBDALR_KWARGS:
+  points:
+    0: 0.0001
+    1: 0.01
+    5: 0.01
+    30: 0.005
+    60: 0.001
+    90: 0.0001
+  interpolation: hermite  # 또는 catmullrom
+  tangents: []
+```
+
+`points`의 키는 완료한 epoch(소수 가능), 값은 절대 학습률입니다.
+키는 따옴표 없이 숫자로 작성하며 내부에서 epoch 오름차순으로 정렬합니다.
+optimizer 업데이트마다 epoch 위치를 계산해 곡선을 적용하므로 epoch 사이도 부드럽게 변합니다.
+처음 몇 점으로 warmup을 직접 표현하고 마지막 점의 LR로 최종 학습률을 지정합니다.
+첫 점 이전과 마지막 점 이후에는 각각 끝점 LR을 유지합니다.
+Hermite의 `tangents`는 epoch 오름차순으로 각 점의 기울기(LR/epoch)이며 생략하거나 `[]`이면 모두 0입니다.
+Catmull–Rom은 인접 점의 epoch 간격을 반영한 중앙 차분 기울기를 사용하고 양끝은 단측 기울기를 사용합니다.
+`hemit`, `catmulrome` 별칭도 지원합니다. 보간 중 음수 LR은 0으로 제한하며 양의 overshoot는 유지합니다.
+모듈별 LR multiplier는 지정한 기준 곡선에 그대로 곱해집니다.
+
+### 학습 없이 LR 그래프 저장
+
+```bash
+python main.py --config_path experiments/APAGNet.yml --plot-lr
+```
+
+`--plot-lr`만 지정하면 StepLR, LambdaLR, MultiStepLR, PolyLR을 한 이미지에 비교합니다.
+이름을 나열하면 지정한 곡선만 표시합니다 (`lamdalr`은 `lambdalr` 별칭).
+
+```bash
+python main.py --config_path experiments/APAGNet.yml --plot-lr multisteplr lambdalr
+```
+
+MultiStepLR은 `milestones`에 지정한 epoch가 완료될 때만 `gamma`를 곱합니다.
+예를 들어 `[30, 60, 80]`이면 30/60/80 epoch 경계에서만 감소합니다.
+
+모델 학습 없이 전체 epoch의 학습률 변화를 `experiments/APAGNet_lr_curve.png`로 저장합니다.
+가로축은 epoch이며, step 기반 스케줄러는 epoch 내부의 warmup과 감소도 표시합니다.
+설정 파일 이름의 확장자를 제거하고 `_lr_curve.png`를 붙여 프로젝트의 `experiments`에 저장하며 기존 이미지는 덮어씁니다.
+재개 체크포인트와 `start_epoch`는 적용하지 않고 처음부터의 설정 곡선을 그립니다.
+
+그래프는 epoch 기준 수식과 보간 함수를 직접 계산하므로 데이터셋에 접근하지 않습니다.
+optimizer/scheduler step을 반복하지 않고 곡선을 샘플링하므로 전체 학습 step 수와 관계없이 빠르게 저장합니다.
+기존 `--steps-per-epoch` 옵션은 호환성을 위해 받지만 그래프 계산에는 사용하지 않습니다.
 
 ## 학습 재개와 검증
 

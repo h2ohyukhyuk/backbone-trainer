@@ -5,8 +5,8 @@
     trainer(model, epoch)
     validationer(model, epoch, valid_loader)
 
-Epochs are numbered from 1. Trainer advances the epoch-based scheduler once
-after training. Validationer aggregates DDP metrics and saves resumable
+Epochs are numbered from 1. Trainer steps batch schedulers after each optimizer
+update and epoch schedulers after training. Validationer aggregates DDP metrics and saves resumable
 checkpoints on rank zero; evaluate: true disables checkpoint saving.
 """
 
@@ -87,6 +87,8 @@ class Trainer:
             self.optimizer.zero_grad(set_to_none=True)
             loss.backward()
             self.optimizer.step()
+            if self.scheduler is not None and getattr(self.scheduler, "step_per_batch", False):
+                self.scheduler.step()
             # Soft-label weighted accuracy for mixed batches.
             if mixed:
                 predictions = output.detach().topk(min(5, output.size(1)), dim=1).indices
@@ -103,7 +105,7 @@ class Trainer:
                 self.report(index, losses, top1, top5, data_time, batch_time)
             self.train_step += 1
             end = time.perf_counter()
-        if self.scheduler is not None:
+        if self.scheduler is not None and not getattr(self.scheduler, "step_per_batch", False):
             self.scheduler.step()
 
     def report(self, index, losses, top1, top5, data_time, batch_time):

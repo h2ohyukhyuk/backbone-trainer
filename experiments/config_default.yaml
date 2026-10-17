@@ -18,11 +18,83 @@ workers: 4                   # Worker count per node
 epochs: 90
 start_epoch: 0
 batch_size: 256               # Total per node; divided among local DDP processes
-lr: 0.1
-momentum: 0.9
-weight_decay: 0.0001
-lr_step_size: 30
-lr_gamma: 0.1
+
+# Optimizer selection and common settings (original get_optimizer variable names)
+OPT_NAME: sgd               # sgd | adam | adamw | rmsprop | adadelta
+LR: 0.01                   # Base LR for every optimizer and scheduler
+WEIGHT_DECAY: 0.0001        # Common weight decay; AdamW uses decoupled weight decay
+
+# Parameter-group LR multipliers (all optimizers)
+USE_LR_MULT: false
+LR_MULT_TARGET: []          # Top-level module name keywords, e.g. [classifier]
+LR_MULT_VAL: []             # Matching positive multipliers, e.g. [10.0]
+
+# --- SGD / RMSprop: shared momentum ---
+MOMENTUM: 0.9              # Used only by SGD and RMSprop
+
+# --- SGD only ---
+SGD_KWARGS:
+  dampening: 0
+  nesterov: false
+
+# --- Adam / AdamW: shared AMSGrad switch ---
+AMS_GRAD: false            # Used only by Adam and AdamW
+
+# --- Adam only ---
+ADAM_KWARGS:
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+# --- AdamW only ---
+ADAMW_KWARGS:
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+# --- RMSprop only (also uses MOMENTUM above) ---
+RMSPROP_KWARGS:
+  alpha: 0.99
+  eps: 1.0e-8
+  centered: false
+
+# --- Adadelta only ---
+ADADELTA_KWARGS:
+  rho: 0.9
+  eps: 1.0e-6
+
+# Scheduler selection: edit only the matching section below.
+lr_scheduler: lambdalr       # steplr | lambdalr | multisteplr | polylr
+
+# --- StepLR: epoch-based staircase decay ---
+STEPLR_KWARGS:
+  step_size: 10             # Decay every N completed epochs
+  gamma: 0.5               # Multiply LR by this factor
+
+# --- LambdaLR: epoch/LR keyframe interpolation (per optimizer update) ---
+LAMBDALR_KWARGS:
+  points:                  # Completed epoch: absolute LR (fractional epochs supported)
+    0: 0.0001
+    2: 0.01
+    10: 0.009
+    20: 0.006
+    30: 0.005
+    40: 0.002
+    50: 0.0019
+    60: 0.001
+    70: 0.0009
+    80: 0.0002
+    90: 0.0001
+  interpolation: hermite   # hermite | catmullrom (aliases: hemit | catmulrome)
+  tangents: []              # Hermite slopes in ascending epoch order; [] means all zero
+
+# --- MultiStepLR: decay at specified epoch milestones ---
+MULTISTEPLR_KWARGS:
+  milestones: [30, 60, 80] # Completed epoch numbers at which LR decays
+  gamma: 0.1               # Multiply LR at each milestone
+
+# --- PolyLR: polynomial decay over all epochs (no warmup) ---
+POLYLR_KWARGS:
+  power: 0.85               # LR * (1 - completed_epochs / epochs) ** power; ends at zero
+
 seed: null                   # Integer for deterministic training, or null
 print_freq: 200
 
