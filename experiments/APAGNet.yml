@@ -1,11 +1,16 @@
 # Only differences from config_default.yaml are needed here.
 # Edit any training setting in YAML; the CLI only selects this file.
 arch: APAGNet                  # net/APAGNet.py:Network(); the alias apag also works
-save: ./checkpoints
 seed: 1024
-dist_url: env://
-
-# Single process / DataParallel:
+# Start one process per visible GPU when invoked as python main.py by ClearML.
+multiprocessing_distributed: true
+world_size: 1
+rank: 0
+gpu: null
+dist_url: tcp://127.0.0.1:29500
+batch_size: 256              # Two GPUs: 128 per GPU; benchmark 384/512 next
+amp: true
+amp_dtype: float16
+# Auto-spawn DDP on all visible GPUs:
 # python main.py --config_path experiments/APAGNet.yml
-# DDP on two local GPUs:
-# torchrun --standalone --nproc_per_node=2 main.py --config_path experiments/APAGNet.yml
+# With torchrun, override multiprocessing_distributed: false in the experiment YAML.

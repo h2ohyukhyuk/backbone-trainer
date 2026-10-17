@@ -5,6 +5,16 @@ import torch.nn as nn
 import torch.nn.init as init
 import numpy as np
 
+def rank_zero_print(*args, **kwargs):
+    """Application console output belongs to global rank zero."""
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        if torch.distributed.get_rank() != 0:
+            return
+    elif int(os.environ.get('RANK', '0')) != 0:
+        return
+    print(*args, **kwargs)
+
+
 class AverageMeter(object):
     """Computes and stores the average and current value"""
     def __init__(self, name, fmt=':f'):
@@ -33,17 +43,17 @@ class AverageMeter(object):
 
 
 def set_network_grad_by_keyword(model, keyword, grad=True, printInfo = False):
-    print("keyword:", keyword, " Grad:", grad)
+    rank_zero_print("keyword:", keyword, " Grad:", grad)
     for name, p in model.named_parameters():
         if keyword in name:
             if printInfo:
                 print ("Freezing layer : ", name)
             p.requires_grad = grad
         elif printInfo:
-            print("Non freezing layer : ", name)
+            rank_zero_print("Non freezing layer : ", name)
 
     if grad == False:
-        print("Batchnorm will be freezed. keyword:", keyword, " Grad:", grad)
+        rank_zero_print("Batchnorm will be freezed. keyword:", keyword, " Grad:", grad)
         for name, p in model.named_modules():
             if keyword in name:
                 if isinstance(p, nn.BatchNorm2d):
@@ -72,22 +82,22 @@ class EarlyStopping(object):
     def step(self, metrics):
         if self.best is None:
             self.best = metrics
-            print("Loss is improved. Best: %.6f" % (self.best))
+            rank_zero_print("Loss is improved. Best: %.6f" % (self.best))
             return ESCondition.VALID
 
         if self.is_better(metrics, self.best):
-            print("Loss is improved. Best: %.6f" % (self.best))
+            rank_zero_print("Loss is improved. Best: %.6f" % (self.best))
             self.num_bad_epochs = 0
             self.best = metrics
             return ESCondition.VALID
         else:
             self.num_bad_epochs += 1
-            print("Loss is not improved. Best: %.6f Current: %.6f" %
+            rank_zero_print("Loss is not improved. Best: %.6f Current: %.6f" %
                   (self.best, metrics))
-            print("Patience: %d/%d" % (self.num_bad_epochs, self.patience))
+            rank_zero_print("Patience: %d/%d" % (self.num_bad_epochs, self.patience))
 
             if self.num_bad_epochs >= self.patience:
-                print("Procedure is ealy stopped.")
+                rank_zero_print("Procedure is ealy stopped.")
                 return ESCondition.STOP
 
             return ESCondition.INVALID
@@ -123,11 +133,11 @@ def make_lr_dict_list(model, base_lr, keywords, mult, use_lr_mult=False):
         named_dict["params"] = model.parameters()
         named_dict["lr"] = base_lr
         dict_list.append(named_dict)
-        print("- lr multiply is not applied")
+        rank_zero_print("- lr multiply is not applied")
         return dict_list
 
-    print("- lr multiply is applied")
-    print("-- base lr: ", base_lr)
+    rank_zero_print("- lr multiply is applied")
+    rank_zero_print("-- base lr: ", base_lr)
     for name, p in model.named_parameters():
         if p.requires_grad:
             tmp_name = name.split('.')[0]
@@ -144,12 +154,12 @@ def make_lr_dict_list(model, base_lr, keywords, mult, use_lr_mult=False):
                 idx = j
                 new_lr = base_lr * mult[idx]
 
-        print("-- group name: ", name_list[i], " new lr: ", new_lr)
+        rank_zero_print("-- group name: ", name_list[i], " new lr: ", new_lr)
         named_dict["params"] = getattr(model, name_list[i]).parameters()
         named_dict["lr"] = new_lr
         dict_list.append(named_dict)
 
-    print(dict_list)
+    rank_zero_print(dict_list)
     return dict_list
 
 def get_optimizer(target_model, **kwargs):

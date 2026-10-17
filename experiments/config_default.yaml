@@ -19,8 +19,12 @@ epochs: 90
 start_epoch: 0
 batch_size: 256               # Total per node; divided among local DDP processes
 
+# NVIDIA mixed precision (CPU automatically uses float32)
+amp: true
+amp_dtype: float16           # float16 uses GradScaler; bfloat16 requires GPU support
+
 # Optimizer selection and common settings (original get_optimizer variable names)
-OPT_NAME: sgd               # sgd | adam | adamw | rmsprop | adadelta
+OPT_NAME: adamw               # sgd | adam | adamw | rmsprop | adadelta
 LR: 0.01                   # Base LR for every optimizer and scheduler
 WEIGHT_DECAY: 0.0001        # Common weight decay; AdamW uses decoupled weight decay
 
@@ -82,7 +86,7 @@ LAMBDALR_KWARGS:
     60: 0.001
     70: 0.0009
     80: 0.0002
-    90: 0.0001
+    90: 0.00005
   interpolation: hermite   # hermite | catmullrom (aliases: hemit | catmulrome)
   tangents: []              # Hermite slopes in ascending epoch order; [] means all zero
 

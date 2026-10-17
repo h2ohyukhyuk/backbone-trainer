@@ -1,0 +1,13 @@
+pip install clearml==2.1.12
+clearml-init
+copy and paste clearml credential
+
+clearml-task \
+  --project APAG \
+  --name apag-baseline \
+  --repo git@github.com:h2ohyukhyuk/backbone-trainer.git \
+  --branch main \
+  --script main.py \
+  --docker clearml-local/torch:2.9.1-py3.12-cu128 \
+  --queue defalult \
+  --args config_path=experiments/APAGNet.yml

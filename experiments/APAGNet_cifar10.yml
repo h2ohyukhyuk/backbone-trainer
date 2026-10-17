@@ -5,7 +5,6 @@ data: ./data/cifar10
 input_size: 32
 download: true
 arch: APAGNet
-save: ./checkpoints
 batch_size: 128
 seed: 1024
 dist_url: env://

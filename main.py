@@ -43,11 +43,11 @@ def read_config(path):
 def validate_config(config):
     """Validate settings without defining any default values in Python."""
     types = {
-        str: ('dataset', 'data', 'arch', 'save', 'resume', 'dist_url', 'dist_backend', 'lr_scheduler', 'OPT_NAME'),
+        str: ('dataset', 'data', 'arch', 'save', 'resume', 'dist_url', 'dist_backend', 'lr_scheduler', 'OPT_NAME', 'amp_dtype'),
         int: ('workers', 'epochs', 'start_epoch', 'batch_size', 'print_freq',
               'world_size', 'rank', 'seed', 'gpu', 'input_size'),
         float: ('LR', 'MOMENTUM', 'WEIGHT_DECAY'),
-        bool: ('evaluate', 'pretrained', 'no_accel', 'multiprocessing_distributed', 'dummy', 'download', 'AMS_GRAD', 'USE_LR_MULT'),
+        bool: ('evaluate', 'pretrained', 'no_accel', 'multiprocessing_distributed', 'dummy', 'download', 'AMS_GRAD', 'USE_LR_MULT', 'amp'),
         dict: ('model_kwargs', 'SGD_KWARGS', 'ADAM_KWARGS', 'ADAMW_KWARGS', 'RMSPROP_KWARGS', 'ADADELTA_KWARGS',
                'STEPLR_KWARGS', 'LAMBDALR_KWARGS', 'MULTISTEPLR_KWARGS', 'POLYLR_KWARGS'),
         list: ('LR_MULT_TARGET', 'LR_MULT_VAL'),
@@ -122,6 +122,8 @@ def validate_config(config):
         raise ValueError('MULTISTEPLR_KWARGS.gamma must be in (0, 1]')
     if not 0 < poly['power'] < float('inf'):
         raise ValueError('POLYLR_KWARGS.power must be finite and positive')
+    if config['amp_dtype'] not in ('float16', 'bfloat16'):
+        raise ValueError('amp_dtype must be float16 or bfloat16')
     if config['OPT_NAME'] not in ('sgd', 'adam', 'adamw', 'rmsprop', 'adadelta'):
         raise ValueError('OPT_NAME must be sgd, adam, adamw, rmsprop or adadelta')
     if not 0 < config['LR'] < float('inf'):
@@ -279,6 +281,9 @@ def create_model(args):
 
 
 def main_ddp():
+    from utils.clearml_utils import remote_bootstrap
+    if not any(arg in ('--plot-lr', '--plot_lr') for arg in sys.argv):
+        remote_bootstrap()
     args = parse_args()
     if args.plot_lr is not None:
         if int(os.environ.get('RANK', '0')) == 0:
@@ -352,22 +357,25 @@ def main(args, device):
     is_main = not args.distributed or args.rank == 0
     dataset_tag = 'imgn' if args.dataset == 'image_net_1K' else args.dataset
     suffix = f'-{dataset_tag}' + ('-dummy' if args.dummy else '')
-    save_dir = Path(args.save) / (args.arch + suffix)
-    handlers = [logging.StreamHandler(sys.stdout)]
+    from utils.run_output import reserve_run_directory, save_run_config
+    output = [None]
     if is_main:
-        save_dir.mkdir(parents=True, exist_ok=True)
+        output[0] = str(reserve_run_directory(Path(args.save) / (args.arch + suffix)))
+    if args.distributed:
+        dist.broadcast_object_list(output, src=0)
+    args.output_dir = output[0]
+    save_dir = Path(args.output_dir)
+    handlers = [logging.StreamHandler(sys.stdout)] if is_main else [logging.NullHandler()]
+    if is_main:
+        save_run_config(args, save_dir)
         handlers.append(logging.FileHandler(save_dir / f'log-{args.arch}{suffix}.txt', mode='a'))
-        config = {key: value for key, value in vars(args).items()
-                  if key not in ('config_path', 'distributed', 'local_world_size', 'plot_lr', 'steps_per_epoch')}
-        if args.multiprocessing_distributed:
-            config['world_size'] //= args.local_world_size
-            config['rank'] //= args.local_world_size
-        with (save_dir / 'config.resolved.yml').open('w', encoding='utf-8') as stream:
-            yaml.safe_dump(config, stream, sort_keys=False)
     logging.basicConfig(level=logging.INFO if is_main else logging.WARNING,
                         format='%(message)s', handlers=handlers, force=True)
+    logging.info('Output directory: %s', save_dir)
     logging.info('Arguments: %s', vars(args))
 
+    from utils.clearml_utils import init_logger, init_best_model_registry
+    logger = init_logger(vars(args))
     model = create_model(args).to(device)
     if args.distributed:
         model = DistributedDataParallel(model, device_ids=[args.gpu] if device.type == 'cuda' else None)
@@ -380,9 +388,12 @@ def main(args, device):
     train_loader = dataset_module.get_train_loader(conf)
     val_loader = dataset_module.get_valid_loader(conf)
     scheduler = get_scheduler(optimizer, {**conf, 'total_steps': len(train_loader) * args.epochs})
-    best_acc1 = load_checkpoint(args, model, optimizer, scheduler)
-    trainer = Trainer(conf, train_loader, optimizer, scheduler)
-    validationer = Validationer(conf, optimizer=optimizer, scheduler=scheduler, best_acc=best_acc1)
+    scaler = torch.amp.GradScaler('cuda', enabled=args.amp and device.type == 'cuda' and args.amp_dtype == 'float16')
+    best_acc1 = load_checkpoint(args, model, optimizer, scheduler, scaler)
+    trainer = Trainer(conf, train_loader, optimizer, scheduler, logger=logger, scaler=scaler)
+    registry = init_best_model_registry(conf) if not args.evaluate else None
+    validationer = Validationer(conf, optimizer=optimizer, scheduler=scheduler, best_acc=best_acc1,
+                               logger=logger, scaler=scaler, registry=registry)
     if args.evaluate:
         validationer(model, args.start_epoch, val_loader)
         return
@@ -397,7 +408,7 @@ def main(args, device):
     logging.info('Total training time: %.2f hours', (time.perf_counter() - started) / 3600)
 
 
-def load_checkpoint(args, model, optimizer, scheduler):
+def load_checkpoint(args, model, optimizer, scheduler, scaler=None):
     if not args.resume:
         return 0.0
     checkpoint = torch.load(args.resume, map_location='cpu', weights_only=True)
@@ -412,6 +423,8 @@ def load_checkpoint(args, model, optimizer, scheduler):
         args.start_epoch = int(checkpoint['epoch'])
         optimizer.load_state_dict(checkpoint['optimizer'])
         scheduler.load_state_dict(checkpoint['scheduler'])
+        if scaler is not None and checkpoint.get('scaler'):
+            scaler.load_state_dict(checkpoint['scaler'])
         logging.info('Resumed %s at epoch %d', args.resume, args.start_epoch)
         return float(checkpoint['best_acc1'])
     logging.warning('Loaded weights only from %s; optimizer/scheduler/epoch start fresh', args.resume)

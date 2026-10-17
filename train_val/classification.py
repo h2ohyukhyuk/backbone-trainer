@@ -21,6 +21,7 @@ import torch.nn as nn
 from torch.nn.parallel import DataParallel, DistributedDataParallel
 
 from utils.train_utils import AverageMeter
+from utils.run_output import resolved_config
 
 
 def get_criterion(conf):
@@ -45,14 +46,26 @@ def accuracy(output, target):
             correct.any(dim=1).float().mean().mul(100).item())
 
 
+def amp_settings(conf, device):
+    enabled = conf.get('amp', False) and device.type == 'cuda'
+    dtype = torch.bfloat16 if conf.get('amp_dtype', 'float16') == 'bfloat16' else torch.float16
+    if enabled and dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
+        raise ValueError('This GPU does not support bfloat16; select amp_dtype: float16')
+    return enabled, dtype
+
+
 class Trainer:
-    def __init__(self, conf, dataloader, optimizer, scheduler):
+    def __init__(self, conf, dataloader, optimizer, scheduler, *, logger=None, scaler=None):
         self.conf = conf
         self.dataloader = dataloader
         self.optimizer = optimizer
         self.scheduler = scheduler
+        self.logger = logger
         self.device = _get_device(conf)
         self.criterion = get_criterion(conf).to(self.device)
+        self.amp_enabled, self.amp_dtype = amp_settings(conf, self.device)
+        self.scaler = scaler if scaler is not None else torch.amp.GradScaler(
+            'cuda', enabled=self.amp_enabled and self.amp_dtype == torch.float16)
         self.report_freq = conf['print_freq']
         self.train_step = conf['start_epoch'] * len(dataloader)
         self.epoch = conf['start_epoch']
@@ -71,8 +84,8 @@ class Trainer:
         if self.conf.get('distributed', False):
             self.dataloader.sampler.set_epoch(epoch - 1)
         losses = AverageMeter('Loss')
-        top1, top5 = AverageMeter('Acc@1'), AverageMeter('Acc@5')
         batch_time, data_time = AverageMeter('Time'), AverageMeter('Data')
+        totals = torch.zeros(2, dtype=torch.float64, device=self.device)
         end = time.perf_counter()
         for index, (images, target) in enumerate(self.dataloader):
             data_time.update(time.perf_counter() - end)
@@ -82,53 +95,65 @@ class Trainer:
             mixed = self.batch_mix is not None and torch.rand(()).item() < 0.1
             if mixed:
                 images, loss_target = self.batch_mix(images, target)
-            output = model(images)
-            loss = self.criterion(output, loss_target)
             self.optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            self.optimizer.step()
-            if self.scheduler is not None and getattr(self.scheduler, "step_per_batch", False):
+            with torch.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.amp_enabled):
+                output = model(images)
+                loss = self.criterion(output, loss_target)
+            self.scaler.scale(loss).backward()
+            previous_scale = self.scaler.get_scale()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            updated = self.scaler.get_scale() >= previous_scale
+            if updated and self.scheduler is not None and getattr(self.scheduler, "step_per_batch", False):
                 self.scheduler.step()
-            # Soft-label weighted accuracy for mixed batches.
-            if mixed:
-                predictions = output.detach().topk(min(5, output.size(1)), dim=1).indices
-                scores = loss_target.gather(1, predictions)
-                acc1 = scores[:, 0].mean().mul(100).item()
-                acc5 = scores.sum(dim=1).mean().mul(100).item()
-            else:
-                acc1, acc5 = accuracy(output.detach(), target)
-            losses.update(loss.item(), images.size(0))
-            top1.update(acc1, images.size(0))
-            top5.update(acc5, images.size(0))
+            count = images.size(0)
+            totals[0] += loss.detach().double() * count
+            totals[1] += count
             batch_time.update(time.perf_counter() - end)
             if index % self.report_freq == 0:
-                self.report(index, losses, top1, top5, data_time, batch_time)
+                losses.avg = (totals[0] / totals[1]).item()
+                self.report(index, losses, data_time, batch_time)
             self.train_step += 1
             end = time.perf_counter()
         if self.scheduler is not None and not getattr(self.scheduler, "step_per_batch", False):
             self.scheduler.step()
 
-    def report(self, index, losses, top1, top5, data_time, batch_time):
+        if self.conf.get('distributed', False):
+            dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+        if totals[1].item() == 0:
+            raise ValueError('Training dataset is empty')
+        train_loss = (totals[0] / totals[1]).item()
+        logging.info(' * Epoch %d Train loss %.4f', epoch, train_loss)
+        if self.logger is not None:
+            self.logger.report_scalar('loss', 'train', train_loss, iteration=epoch)
+            self.logger.report_scalar('learning rate', 'train', self.optimizer.param_groups[0]['lr'], iteration=epoch)
+        return train_loss
+
+    def report(self, index, losses, data_time, batch_time):
         logging.info('Epoch [%d] [%d/%d] Step %d Data %.3f Time %.3f '
-                     'Loss %.4f Acc@1 %.3f Acc@5 %.3f LR %.6g',
+                     'Train loss %.4f LR %.6g',
                      self.epoch, index + 1, len(self.dataloader), self.train_step,
-                     data_time.val, batch_time.val, losses.avg, top1.avg, top5.avg,
+                     data_time.val, batch_time.val, losses.avg,
                      self.optimizer.param_groups[0]['lr'])
 
 
 class Validationer:
-    def __init__(self, conf, *, optimizer=None, scheduler=None, best_acc=0.0):
+    def __init__(self, conf, *, optimizer=None, scheduler=None, best_acc=0.0, logger=None, scaler=None, registry=None):
+        self.registry = registry
+        self.logger = logger
+        self.scaler = scaler
         self.conf = conf
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.device = _get_device(conf)
         self.criterion = get_criterion(conf).to(self.device)
+        self.amp_enabled, self.amp_dtype = amp_settings(conf, self.device)
         self.report_freq = conf['print_freq']
         self.distributed = conf.get('distributed', False)
         self.is_main = not self.distributed or conf['rank'] == 0
         dataset_tag = 'imgn' if conf['dataset'] == 'image_net_1K' else conf['dataset']
         suffix = f'-{dataset_tag}' + ('-dummy' if conf['dummy'] else '')
-        self.local_path = Path(conf['save']) / (conf['arch'] + suffix)
+        self.local_path = Path(conf['output_dir']) if conf.get('output_dir') else Path(conf['save']) / (conf['arch'] + suffix)
         self.best_acc = float(best_acc)
         self.epoch = conf['start_epoch']
         self.is_best = False
@@ -147,8 +172,9 @@ class Validationer:
         for index, (images, target) in enumerate(dataloader):
             images = images.to(self.device, non_blocking=True)
             target = target.to(self.device, non_blocking=True)
-            output = eval_model(images)
-            loss = self.criterion(output, target)
+            with torch.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.amp_enabled):
+                output = eval_model(images)
+                loss = self.criterion(output, target)
             acc1, acc5 = accuracy(output, target)
             count = images.size(0)
             totals += totals.new_tensor([loss.item() * count, acc1 * count, acc5 * count, count])
@@ -164,7 +190,11 @@ class Validationer:
         if not self.conf['evaluate']:
             self.best_acc = max(self.best_acc, acc1)
             if self.is_main:
-                self.save(model)
+                self.save(model, valid_loss=loss, acc1=acc1, acc5=acc5)
+        if self.logger is not None:
+            self.logger.report_scalar('loss', 'valid', loss, iteration=epoch)
+            self.logger.report_scalar('accuracy', 'valid_top1', acc1, iteration=epoch)
+            self.logger.report_scalar('accuracy', 'valid_top5', acc5, iteration=epoch)
         self.report(loss, acc1, acc5)
         return acc1
 
@@ -172,7 +202,7 @@ class Validationer:
         logging.info(' * Epoch %d Loss %.4f Acc@1 %.3f Acc@5 %.3f',
                      self.epoch, loss, acc1, acc5)
 
-    def save(self, model):
+    def save(self, model, *, valid_loss, acc1, acc5):
         self.local_path.mkdir(parents=True, exist_ok=True)
         state = {
             'epoch': self.epoch,
@@ -180,12 +210,20 @@ class Validationer:
             'dataset': self.conf['dataset'],
             'state_dict': unwrap_model(model).state_dict(),
             'best_acc1': self.best_acc,
+            'config': resolved_config(self.conf),
+            'metrics': {'valid_loss': valid_loss, 'top1': acc1, 'top5': acc5},
         }
         if self.optimizer is not None:
             state['optimizer'] = self.optimizer.state_dict()
         if self.scheduler is not None:
             state['scheduler'] = self.scheduler.state_dict()
+        if self.scaler is not None:
+            state['scaler'] = self.scaler.state_dict()
         path = self.local_path / f'{self.epoch:03d}.pt'
         torch.save(state, path)
         if self.is_best:
-            shutil.copyfile(path, self.local_path / 'model_best.pth.tar')
+            best_path = self.local_path / 'model_best.pt'
+            shutil.copyfile(path, best_path)
+            if self.is_main and self.registry is not None:
+                uri = self.registry.update(best_path, epoch=self.epoch, accuracy=self.best_acc, accuracy_top5=acc5)
+                logging.info('ClearML best model uploaded: %s', uri)
