@@ -6,7 +6,7 @@ HPO serch: architecture → batch size → LR
 
 clearml-task \
   --project APAG \
-  --name apag-baseline \
+  --name apagtf-baseline \
   --repo git@github.com:h2ohyukhyuk/backbone-trainer.git \
   --branch main \
   --script main.py \
