@@ -1,6 +1,6 @@
 # Only differences from config_default.yaml are needed here.
 # Edit any training setting in YAML; the CLI only selects this file.
-arch: APAGMRNet                  # net/APAGNet.py:Network(); the alias apag also works
+arch: APAGNet0                  # net/APAGNet.py:Network(); the alias apag also works
 
 # Start one process per visible GPU when invoked as python main.py by ClearML.
 multiprocessing_distributed: true
