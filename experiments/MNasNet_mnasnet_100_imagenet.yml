@@ -1,12 +1,18 @@
-# Run: python main.py --config_path experiments/MNasNet_mnasnet_100_imagenet.yml
-# Unspecified settings are inherited from experiments/config_default.yaml.
+# Only differences from config_default.yaml are needed here.
+# Edit any training setting in YAML; the CLI only selects this file.
 arch: MNasNet
-dataset: image_net_1K
-data: /home/j/database/ImageNet1K
-input_size: 224
-# Top-level pretrained is for torchvision; local backbones use model_kwargs.
-pretrained: false
 model_kwargs:
   backbone_name: mnasnet_100
   backbone_pretrained: false
-save: ./checkpoints/MNasNet_mnasnet_100_imagenet
+
+# Start one process per visible GPU when invoked as python main.py by ClearML.
+multiprocessing_distributed: true
+num_nodes: 1
+node_rank: 0
+
+dist_url: tcp://127.0.0.1:29500
+batch_size: 768              # Two GPUs: 384 per GPU
+
+# Auto-spawn DDP on all visible GPUs:
+# python main.py --config_path experiments/MNasNet_mnasnet_100_imagenet.yml
+# With torchrun, override multiprocessing_distributed: false in the experiment YAML.
