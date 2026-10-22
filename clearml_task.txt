@@ -6,7 +6,7 @@ HPO serch: architecture → batch size → LR
 
 clearml-task \
   --project APAG \
-  --name apag0-baseline \
+  --name apag-resnet18 \
   --repo git@github.com:h2ohyukhyuk/backbone-trainer.git \
   --branch main \
   --script main.py \
@@ -14,7 +14,7 @@ clearml-task \
   --docker clearml-local/torch:2.9.1-py3.12-cu128 \
   --docker_args="--shm-size=16g" \
   --queue default \
-  --args config_path=experiments/config.yml
+  --args config_path=experiments/APAGResNet_resnet18_imagenet.yml
 
 
   python hpo-lr.py \
