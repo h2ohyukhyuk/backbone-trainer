@@ -1,0 +1,13 @@
+# Run: python main.py --config_path experiments/MNasNet_mnasnet_075_imagenet.yml
+# Unspecified settings are inherited from experiments/config_default.yaml.
+arch: MNasNet
+dataset: image_net_1K
+data: /home/j/database/ImageNet1K
+input_size: 224
+# Top-level pretrained is for torchvision; local backbones use model_kwargs.
+pretrained: false
+model_kwargs:
+  backbone_name: mnasnet_075
+  # No pretrained weights for mnasnet_075 in the installed timm.
+  backbone_pretrained: false
+save: ./checkpoints/MNasNet_mnasnet_075_imagenet

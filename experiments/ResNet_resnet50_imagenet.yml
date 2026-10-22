@@ -1,0 +1,12 @@
+# Run: python main.py --config_path experiments/ResNet_resnet50_imagenet.yml
+# Unspecified settings are inherited from experiments/config_default.yaml.
+arch: ResNet
+dataset: image_net_1K
+data: /home/j/database/ImageNet1K
+input_size: 224
+# Top-level pretrained is for torchvision; local backbones use model_kwargs.
+pretrained: false
+model_kwargs:
+  backbone_name: resnet50
+  backbone_pretrained: false
+save: ./checkpoints/ResNet_resnet50_imagenet

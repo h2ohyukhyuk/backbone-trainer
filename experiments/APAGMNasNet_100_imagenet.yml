@@ -1,0 +1,12 @@
+# Run: python main.py --config_path experiments/APAGMNasNet_100_imagenet.yml
+# Unspecified settings are inherited from config_default.yaml.
+arch: APAGMNasNet
+dataset: image_net_1K
+data: /home/j/database/ImageNet1K
+input_size: 224
+# Top-level pretrained is for torchvision; local backbones use model_kwargs.
+pretrained: false
+model_kwargs:
+  backbone_name: mnasnet_100
+  backbone_pretrained: false
+save: ./checkpoints/APAGMNasNet_100_imagenet
